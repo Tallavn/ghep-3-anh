@@ -31,7 +31,7 @@
 <body>
 <h1>Ghép ảnh Control Center · Factory · Trade</h1>
 <div class="row" id="actions"></div>
-<button id="btnAndroidShare" hidden>Ghép 3 ảnh và chia sẻ</button>
+<button id="btnAndroidShare" hidden>Ghép 4 ảnh gần nhất và chia sẻ</button>
 <div id="status">Đang khởi động…</div>
 <canvas id="out"></canvas>
 <div class="row" id="resultBtns" style="display:none">
@@ -64,6 +64,7 @@
 </details>
 <input type="file" id="fileIn" accept="image/*" multiple>
 <input type="file" id="androidFileIn" accept="image/*" multiple>
+<input type="file" id="androidDirIn" accept="image/*" webkitdirectory directory multiple>
 
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
 <script>
@@ -990,7 +991,7 @@ const blobOf = ()=>new Promise(r=>$("out").toBlob(r,"image/png"));
 async function shareData(){
   const blob = await blobOf();
   if(!blob) throw new Error("Không xuất được PNG.");
-  return {files:[new File([blob],$("out").dataset.name,{type:"image/png"})]};
+  return {files:[new File([blob],$("out").dataset.name,{type:"image/png"})],title:"Acc",text:"Acc"};
 }
 async function share(data){
   if(!navigator.share || !navigator.canShare?.(data)){
@@ -1078,7 +1079,7 @@ androidButton.hidden = !/Android/i.test(navigator.userAgent);
 
 function resetAndroidShare(){
   pendingAndroidShare = null;
-  androidButton.textContent = "Ghép 3 ảnh và chia sẻ";
+  androidButton.textContent = "Ghép 4 ảnh gần nhất và chia sẻ";
 }
 
 async function shareOnAndroid(){
@@ -1091,7 +1092,10 @@ const waitIdle = async () => { while(busy) await new Promise(r => setTimeout(r,1
 async function composeAndShare(files){
   await waitIdle();
   lastScan = "";
-  if(!await run(files,{forSharing:true})) return;
+  const inputFiles = (/Android/i.test(navigator.userAgent) || androidFolderMode)
+    ? recentCandidates(files).slice(0,4).map(x=>x.file) : files;
+  if(inputFiles.length < 4){ status("Cần ít nhất 4 ảnh trong thư mục đã chọn."); return; }
+  if(!await run(inputFiles,{forSharing:true})) return;
   const data = await shareData();
   if(!navigator.share || !navigator.canShare?.(data)){
     status("Trình duyệt này không hỗ trợ chia sẻ ảnh. Hãy bấm Lưu ảnh.");
@@ -1126,9 +1130,24 @@ androidButton.onclick = async () => {
   try{
     if(pendingAndroidShare){ await shareOnAndroid(); return; }
     const files = await rememberedFolderFiles();
-    if(files === null){ androidInput.click(); return; }
+    if(files === null){ androidDirIn.click(); return; }
     if(files) await composeAndShare(files);
   }catch(e){ status(e.message); }
+  finally{ androidButton.disabled = false; }
+};
+
+let androidFolderMode = false;
+const androidDirIn = $("androidDirIn");
+androidDirIn.onchange = async () => {
+  const files = [...androidDirIn.files];
+  androidDirIn.value = "";
+  if(files.length < 4){ status("Thư mục phải có ít nhất 4 ảnh."); return; }
+  androidFolderMode = true;
+  sourceFiles = files;
+  setActions([["Đổi thư mục",()=>androidDirIn.click(),true]]);
+  androidButton.disabled = true;
+  try{ await composeAndShare(files); }
+  catch(e){ status(e.message); }
   finally{ androidButton.disabled = false; }
 };
 
@@ -1136,7 +1155,7 @@ androidInput.onchange = async () => {
   const files = [...androidInput.files];
   androidInput.value = "";
   if(busy) return;
-  if(files.length < 3){ status("Hãy chọn ít nhất 3 ảnh CC, Factory và Trade. Có thể chọn thêm ảnh Plant."); return; }
+  if(files.length < 4){ status("Hãy chọn thư mục có ít nhất 4 ảnh gần nhất."); return; }
   sourceFiles = files;
   setActions([["Chọn lại ảnh",pickFiles,true]]);
   androidButton.disabled = true;
