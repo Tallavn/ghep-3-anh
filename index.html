@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ghép 3 ảnh CC · Factory · Trade</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<meta name="theme-color" content="#15171c">
 <style>
   :root{--bg:#14161a;--card:#1d2026;--tx:#e8eaee;--mut:#8b92a0;--ac:#4f9dff;--ok:#3ecf8e;--er:#ff6b6b}
   *{box-sizing:border-box}
@@ -926,6 +929,7 @@ $("setDeleteOriginals").onchange = async e => {
   await kvSet("delete-originals",deleteOriginalsEnabled);
 };
 loadSettings().then(start);
+if("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(()=>{});
 setInterval(() => {
   if(dirHandle && !sourceFiles && !busy && document.visibilityState === "visible") start();
 },12000);
