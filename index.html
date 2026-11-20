@@ -70,8 +70,9 @@
 "use strict";
 /* ====== cấu hình ====== */
 const MAX_SCAN   = 120;     // tối đa số ảnh mới nhất được xét
-const OUT_WIDTH  = 1289;   // độ rộng PNG
+const COLUMN_WIDTH = 1289; // giữ nguyên tỉ lệ hàng phòng của bản dọc
 const ORDER      = ["cc","fac","trade"];
+const PLANT_TYPE = "plant";
 const RX = {
   cc:    /control\s*c[e3]nter|trung\s*t[aâ]m\s*[dđ]i[eề]u\s*khi[eể]n|控制中枢/i,
   fac:   /factory|manufactur|nh[aà]\s*m[aá]y|制造站/i,
@@ -113,13 +114,17 @@ async function ocrText(file){
   return {text:data.text || "",landscape};
 }
 
-/* ====== phân loại 1 ảnh: cc | fac | trade | combined | none ====== */
+/* ====== phân loại 1 ảnh: cc | fac | trade | plant | combined | none ====== */
 async function classify(file){
   const nm = file.name;
   if(isCollage(nm)) return "combined";
-  const key = `cls-v5|${nm}|${file.size}|${file.lastModified}`;
+  const key = `cls-v6|${nm}|${file.size}|${file.lastModified}`;
   const cached = await kvGet(key);
   if(cached !== undefined) return cached;
+  if((await readPlantRows(file)).length === 2){
+    await kvSet(key,PLANT_TYPE);
+    return PLANT_TYPE;
+  }
   const t = performance.now();
   const {text,landscape} = await ocrText(file);
   timing.ocr += performance.now()-t; timing.ocrCount++;
@@ -176,6 +181,7 @@ let lastScan = "";
 let lastResult = "";
 let busy = false;
 let resultFiles = [];
+let plantRows = [];
 let scannedFiles = [];
 let directoryScanVersion = 0;
 let deleteOriginalsEnabled = false;
@@ -202,6 +208,7 @@ function clearResult(){
   delete $("out").dataset.name;
   lastResult = "";
   resultFiles = [];
+  plantRows = [];
   updateDeleteButton();
 }
 
@@ -224,9 +231,10 @@ async function run(files,{forSharing = false} = {}){
     if(!candidates.length){ clearResult(); status("Không có ảnh phù hợp."); return; }
     if(typeof Tesseract === "undefined"){ status("Không tải được OCR. Kiểm tra mạng rồi tải lại trang."); return; }
 
-    // chỉ xét PHIÊN MỚI NHẤT (các ảnh CC/Factory/Trade trong 5 phút tính từ ảnh hợp lệ mới nhất).
+    // Phiên được xác định bởi ảnh CC/Factory/Trade. Plant là ảnh bổ sung cùng phiên.
     // Thiếu loại nào vẫn xuất ảnh, phần thiếu ghi lỗi (không lùi về phiên cũ hơn).
     const recent = [];
+    const plantCandidates = [];
     let hadError = false, newest = null, group = null;
     for(const [index,item] of candidates.entries()){
       if(newest !== null && newest - item.time > SESSION_MS) break;
@@ -235,11 +243,16 @@ async function run(files,{forSharing = false} = {}){
       try { type = await classify(item.file); }
       catch(e){ log("Lỗi " + item.file.name + ": " + e.message,"er"); hadError = true; continue; }
       if(type === "mixed"){ log("Bỏ qua (lẫn nhiều loại): " + item.file.name,"er"); continue; }
+      if(type === PLANT_TYPE){
+        plantCandidates.push(item);
+        if(group?.every(Boolean)) break;
+        continue;
+      }
       if(!ORDER.includes(type)) continue;
       if(newest === null) newest = item.time;
       recent.push({...item,type});
       group = ORDER.map(key => recent.find(entry => entry.type === key)?.file || null);
-      if(group.every(Boolean)) break;
+      if(group.every(Boolean) && plantCandidates.some(plant => Math.abs(plant.time-newest) <= SESSION_MS)) break;
     }
     if(forSharing && !group?.every(Boolean)){
       clearResult();
@@ -252,12 +265,14 @@ async function run(files,{forSharing = false} = {}){
       status(hadError ? "Có lỗi đọc ảnh hoặc tải OCR. Kiểm tra mạng rồi quét lại." : "Không thấy ảnh Control Center / Factory / Trade nào.");
       return;
     }
-    const result = JSON.stringify([group.map(f => f ? identity(f) : null),MORALE_ALERT]);   // đổi mốc thì xuất lại
+    const plant = plantCandidates.find(item => Math.abs(item.time-newest) <= SESSION_MS)?.file ?? null;
+    const result = JSON.stringify([group.map(f => f ? identity(f) : null),plant && identity(plant),MORALE_ALERT]);
     if(result !== lastResult){
       resetAndroidShare();
       resultFiles = [];
       updateDeleteButton();
       status("Đang ghép…");
+      plantRows = plant ? await readPlantRows(plant,{crop:true}) : [];
       await compose(group);
       lastResult = result;
       if(!forSharing && autoDownload && await kvGet("last-download") !== result){
@@ -269,6 +284,10 @@ async function run(files,{forSharing = false} = {}){
     resultFiles = group.filter(file => file && fileEntries.has(file));
     updateDeleteButton();
     ORDER.forEach((key,i) => log(key.toUpperCase() + " ← " + (group[i] ? group[i].name : "THIẾU ẢNH"), group[i] ? "ok" : "er"));
+    if(plantRows.length){
+      log("POWER PLANT 2" + (plantRows.some(row => row.room==="HR") ? " / HR" : "") +
+        " ← " + plant.name, "ok");
+    }
     status(lastAlert ? "Xong. ⚠ CẢNH BÁO: " + lastAlert : "Xong.");
     if(timing.listed) log("Thời gian: đọc tên " + timing.listed + " file " + (timing.list/1000).toFixed(1) + "s · mở file " + (timing.open/1000).toFixed(1) + "s · nhận dạng " + timing.ocrCount + " ảnh mới " + (timing.ocr/1000).toFixed(1) + "s");
     return true;
@@ -277,9 +296,9 @@ async function run(files,{forSharing = false} = {}){
 }
 
 /* ====== ghép ảnh (kiểu Color Rail) ====== */
-const COLORS = {cc:"#e8ecf1", fac:"#ffc400", trade:"#19a7ff"};
-const RAIL_TEXT = {cc:"#0f1218", fac:"#0f1218", trade:"#ffffff"};
-const RAIL_NAME = {cc:"CONTROL", fac:"FACTORY", trade:"TRADING"};
+const COLORS = {cc:"#e8ecf1", fac:"#ffc400", trade:"#19a7ff", plant:"#c7f133", hr:"#e8ecf1"};
+const RAIL_TEXT = {cc:"#0f1218", fac:"#0f1218", trade:"#ffffff", plant:"#0f1218", hr:"#0f1218"};
+const RAIL_NAME = {cc:"CONTROL", fac:"FACTORY", trade:"TRADING", plant:"PLANT", hr:"HR"};
 /* vị trí đầu mỗi hàng phòng trong ảnh chụp (đơn vị tham chiếu ảnh rộng 2576) */
 const ROW_TOPS = {cc:[195], fac:[153,409,666,925], trade:[228,484,742]};
 const REF = {x0:1212, x1:2428, h:204, w:2576};
@@ -512,6 +531,60 @@ function pixelsOf(bitmap){
   const x = c.getContext("2d",{willReadFrequently:true}); x.drawImage(bitmap,0,0);
   return {data:x.getImageData(0,0,c.width,c.height).data, w:c.width, h:c.height, k:c.width/REF.w};
 }
+// Dùng vạch cấp phòng xanh lá để tìm hai hàng Power Plant ở đầu ảnh riêng.
+// Hai ảnh mẫu đều có Plant 1 và 2; mỗi ảnh là một lựa chọn độc lập.
+function plantTops(px){
+  const {data,w,h,k} = px;
+  if(w <= h || w < 900) return [];
+  const bands = [];
+  const left = Math.round(1420*k), right = Math.round(1485*k);
+  let start = null;
+  for(let y=Math.round(135*k);y<Math.min(h,Math.round(670*k));y++){
+    let lime = 0;
+    for(let x=left;x<right;x++){
+      const i=(y*w+x)*4;
+      if(data[i]>110 && data[i+1]>155 && data[i+2]<95 && data[i+1]-data[i+2]>90) lime++;
+    }
+    if(lime>=7*k){ if(start===null) start=y; }
+    else if(start!==null){
+      if(y-start>=14*k) bands.push(start/k);
+      start=null;
+    }
+  }
+  if(bands.length!==2 || bands[0]>210 || Math.abs(bands[1]-bands[0]-256)>8) return [];
+  const tops = bands.map(y => findTop(px,y-19));
+  return tops[1]+REF.h+4<=h/k ? tops : [];
+}
+async function readPlantRows(file,{crop=false}={}){
+  const bitmap = await createImageBitmap(file);
+  try{
+    if(bitmap.width<=bitmap.height || bitmap.width<900) return [];
+    const px = pixelsOf(bitmap);
+    const tops = plantTops(px);
+    const rows = tops.map((top,index) => ({
+      room:"P"+(index+1), top,
+      distracted:distracted(px,top,0),
+      canvas:crop ? rowCanvas(bitmap,top,false) : null
+    }));
+    if(crop && tops.length===2){
+      const top = findTop(px,tops[1]+320);
+      if(top+REF.h+4<=px.h/px.k && hasOfficeLevelBadge(px,top)){
+        rows.push({room:"HR",top,distracted:distracted(px,top,0),canvas:rowCanvas(bitmap,top,false)});
+      }
+    }
+    return rows;
+  }finally{ bitmap.close(); }
+}
+function hasOfficeLevelBadge({data,w,k},top){
+  let white = 0;
+  for(let y=Math.round((top+21)*k);y<Math.round((top+52)*k);y++){
+    for(let x=Math.round(1315*k);x<Math.round(1371*k);x++){
+      const i=(y*w+x)*4;
+      if(data[i]>230 && data[i+1]>230 && data[i+2]>230) white++;
+    }
+  }
+  return white>120*k*k;
+}
 /* game cuộn lệch vài px mỗi lần chụp: dò mép trên thật của hàng (nền sáng -> nền tối) quanh vị trí chuẩn ±30 */
 function findTop(px,T){
   const {data,w,h,k} = px, x0 = Math.floor(1477*k), x1 = Math.floor(1517*k);
@@ -637,8 +710,10 @@ async function compose(list){
   const time = pad(now.getHours()) + ":" + pad(now.getMinutes());
 
   const M=48, RW=56, RG=14, GAP=8, SG=22, HD=186, BOTTOM=20;
-  const W = OUT_WIDTH;
-  const TW = W - M*2 - RW - RG;
+  const columnStep = COLUMN_WIDTH - M*2 + SG;
+  const W = COLUMN_WIDTH + columnStep;
+  const TW = COLUMN_WIDTH - M*2 - RW - RG;
+  const s = TW/(REF.x1-REF.x0);
   const TH = Math.round(TW*REF.h/(REF.x1-REF.x0));
 
   const sections = [];
@@ -678,6 +753,10 @@ async function compose(list){
     } finally { bitmap.close && bitmap.close(); }
   }
 
+  for(const [room,key] of [["P2","plant"],["HR","hr"]]){
+    const row = plantRows.find(entry => entry.room===room);
+    if(row?.canvas) sections.push({key,rows:[row.canvas],height:TH});
+  }
   if(stopped) warns.unshift("Có phòng Stopped (dừng hoạt động)");
   // tự nhận team: team có ít chỗ lệch nhất (hòa thì theo lịch giờ)
   const errorsOf = t => roomSlots.map(x => ({...x,...checkRoom(t,x.room,x.slots)})).filter(e => e.missing.length || e.extra.length);
@@ -711,8 +790,17 @@ async function compose(list){
   banners.forEach(b => b.h = 64 + b.lines.length*36 + (b.lines.length ? 10 : 0));
   const AH = banners.reduce((s,b) => s + b.h + 12, 0);
 
+  // CC và FAC bên trái; Trade, Plant 2 và HR bên phải. Giữ chỉ số
+  // sections theo thứ tự ảnh nguồn để nhãn % và cảnh báo bám đúng phòng.
+  const columns = [HD+AH,HD+AH];
+  for(const sec of sections){
+    const col = sec.key==="cc" || sec.key==="fac" ? 0 : 1;
+    sec.x = M+col*columnStep;
+    sec.y = columns[col];
+    columns[col] += sec.height+SG;
+  }
   cv.width = W;
-  cv.height = AH + HD + sections.reduce((s,x)=>s+x.height,0) + SG*(sections.length-1) + BOTTOM;
+  cv.height = Math.max(...columns)-SG+BOTTOM;
   g.fillStyle = "#0d1117";
   g.fillRect(0,0,cv.width,cv.height);
   g.imageSmoothingQuality = "high";
@@ -724,42 +812,43 @@ async function compose(list){
   // giờ + ngày + team trên một dòng
   g.textBaseline = "alphabetic"; g.textAlign = "left";
   g.font = "800 124px " + FONT; g.letterSpacing = "-4px";
-  const w1 = g.measureText(time).width;
-  g.font = "500 34px " + FONT; g.letterSpacing = "4px";
-  const w2 = g.measureText(date).width;
-  let x = (W-(w1+48+w2))/2; const base = 150;
+  const clock = g.measureText(time);
+  const clockX = M+RW+RG+(SLOT.x+2*SLOT.pitch)*s+clock.actualBoundingBoxLeft;
+  const base = 150;
   g.fillStyle = "#ffffff"; g.font = "800 124px " + FONT; g.letterSpacing = "-4px";
-  g.fillText(time,x,base);
+  g.fillText(time,clockX,base);
   g.fillStyle = "#828d9c"; g.font = "500 34px " + FONT; g.letterSpacing = "4px";
-  g.fillText(date,x+w1+48,base);
+  g.fillText(date,clockX+clock.width+48,base);
   g.letterSpacing = "0px";
 
   // vẽ băng cảnh báo
   let by = HD - 8;
+  const bannerWidth = COLUMN_WIDTH-2*M;
   for(const b of banners){
     g.fillStyle = b.color;
-    g.beginPath(); g.roundRect(M,by,W-2*M,b.h,14); g.fill();
+    g.beginPath(); g.roundRect(M,by,bannerWidth,b.h,14); g.fill();
     g.fillStyle = b.ink; g.textBaseline = "middle";
     g.font = "800 32px " + FONT; g.letterSpacing = "1px";
     g.textAlign = b.lines.length ? "left" : "center";
-    g.fillText(b.title, b.lines.length ? M+24 : W/2, by+33);
+    g.fillText(b.title, b.lines.length ? M+24 : M+bannerWidth/2, by+33);
     g.letterSpacing = "0px"; g.textAlign = "left";
     b.lines.forEach((line,k) => {
       let fs = 24; g.font = "600 " + fs + "px " + FONT;
-      while(g.measureText(line).width > W-2*M-48 && fs > 14){ fs--; g.font = "600 " + fs + "px " + FONT; }
-      g.fillText(line, M+24, by+64+k*36+12);
+      while(g.measureText(line).width > bannerWidth-48 && fs > 14){ fs--; g.font = "600 " + fs + "px " + FONT; }
+      g.fillText(line, M+24, by+64+k*36+12,bannerWidth-48);
     });
     g.textBaseline = "alphabetic";
     by += b.h + 12;
   }
 
   // từng nhóm: dải màu dọc + các hàng phòng
-  let y = HD + AH;
   for(const sec of sections){
+    const {x,y} = sec;
+    const rowX = x+RW+RG;
     g.fillStyle = COLORS[sec.key];
-    g.beginPath(); g.roundRect(M,y,RW,sec.height,14); g.fill();
+    g.beginPath(); g.roundRect(x,y,RW,sec.height,14); g.fill();
     g.save();
-    g.translate(M+RW/2,y+sec.height/2); g.rotate(-Math.PI/2);
+    g.translate(x+RW/2,y+sec.height/2); g.rotate(-Math.PI/2);
     g.fillStyle = RAIL_TEXT[sec.key]; g.font = "800 20px " + FONT; g.letterSpacing = "4px";
     g.textAlign = "center"; g.textBaseline = "middle";
     g.fillText(RAIL_NAME[sec.key],2,1);
@@ -767,31 +856,28 @@ async function compose(list){
     g.letterSpacing = "0px"; g.textAlign = "left"; g.textBaseline = "alphabetic";
     if(sec.missing){   // khung trống báo thiếu ảnh
       g.save();
-      g.fillStyle = "#1a1f27"; g.beginPath(); g.roundRect(M+RW+RG,y,TW,sec.height,10); g.fill();
+      g.fillStyle = "#1a1f27"; g.beginPath(); g.roundRect(rowX,y,TW,sec.height,10); g.fill();
       g.strokeStyle = ALERT_COLOR; g.lineWidth = 3; g.setLineDash([14,10]);
-      g.beginPath(); g.roundRect(M+RW+RG+2,y+2,TW-4,sec.height-4,10); g.stroke();
+      g.beginPath(); g.roundRect(rowX+2,y+2,TW-4,sec.height-4,10); g.stroke();
       g.setLineDash([]);
       g.fillStyle = ALERT_COLOR; g.font = "800 40px " + FONT; g.letterSpacing = "2px";
       g.textAlign = "center"; g.textBaseline = "middle";
-      g.fillText("⚠  THIẾU ẢNH " + FULL_NAME[sec.key].toUpperCase(), M+RW+RG+TW/2, y+sec.height/2);
+      g.fillText("⚠  THIẾU ẢNH " + FULL_NAME[sec.key].toUpperCase(), rowX+TW/2, y+sec.height/2);
       g.restore();
       g.letterSpacing = "0px"; g.textAlign = "left"; g.textBaseline = "alphabetic";
     }
     let yy = y;
     for(const row of sec.rows){
       g.save();
-      g.beginPath(); g.roundRect(M+RW+RG,yy,TW,TH,10); g.clip();
-      g.drawImage(row,M+RW+RG,yy,TW,TH);
+      g.beginPath(); g.roundRect(rowX,yy,TW,TH,10); g.clip();
+      g.drawImage(row,rowX,yy,TW,TH);
       g.restore();
       yy += TH+GAP;
     }
-    sec.y = y;
-    y += sec.height+SG;
   }
 
   // % năng suất từng phòng: số lớn = theo người đang làm; dòng nhỏ = chuẩn nếu đúng combo team
   {
-    const s = TW/(REF.x1-REF.x0);
     const working = x => x.slots.filter(sl => !sl.dis).map(sl => sl.name || "?");
     const ahOf = lists => lists.reduce((n,l) => n + l.filter(m => AH_OPS.includes(m)).length, 0);
     const facRooms = roomSlots.filter(x => x.room[0] === "F");
@@ -826,7 +912,7 @@ async function compose(list){
         : (cur.pct > 200 ? "excellent" : cur.pct > 120 ? "good" : "normal");
       const color = efficiency === "low" ? LINEUP_COLOR
         : efficiency === "normal" ? "#d4d8de" : MARK_COLOR;
-      const bx = M+RW+RG + 94*s, bw = 100*s;
+      const bx = sections[x.i].x+RW+RG+94*s, bw = 100*s;
       const by = sections[x.i].y + x.r*(TH+GAP) + 145*s, bh = 44*s;
       g.save();
       g.fillStyle = "#555";
@@ -845,9 +931,8 @@ async function compose(list){
   }
 
   // vòng khoanh 1 ô + nhãn
-  const s = TW/(REF.x1-REF.x0);
   const ring = (i,r,j,color,label,ink,width) => {
-    const rx = M+RW+RG + (SLOT.x + j*SLOT.pitch - 6)*s;
+    const rx = sections[i].x+RW+RG + (SLOT.x + j*SLOT.pitch - 6)*s;
     const ry = sections[i].y + r*(TH+GAP) + (SLOT.dy-4-6)*s;
     const rw = (SLOT.w+12)*s, rh = (SLOT.h+10)*s;
     g.save();
@@ -874,7 +959,7 @@ async function compose(list){
   // hàng có ⚠: viền đỏ cả hàng; ô Distracted: vòng đỏ
   for(const b of badRows){
     g.save(); g.strokeStyle = ALERT_COLOR; g.lineWidth = 4; g.shadowColor = ALERT_COLOR; g.shadowBlur = 10;
-    g.beginPath(); g.roundRect(M+RW+RG-2, sections[b.i].y + b.r*(TH+GAP) - 2, TW+4, TH+4, 12); g.stroke(); g.restore();
+    g.beginPath(); g.roundRect(sections[b.i].x+RW+RG-2, sections[b.i].y + b.r*(TH+GAP) - 2, TW+4, TH+4, 12); g.stroke(); g.restore();
   }
   for(const b of badSlots)
     if(!(mark && mark.i===b.i && mark.r===b.r && mark.j===b.j))
@@ -1051,7 +1136,7 @@ androidInput.onchange = async () => {
   const files = [...androidInput.files];
   androidInput.value = "";
   if(busy) return;
-  if(files.length !== 3){ status("Hãy chọn đúng 3 ảnh."); return; }
+  if(files.length < 3){ status("Hãy chọn ít nhất 3 ảnh CC, Factory và Trade. Có thể chọn thêm ảnh Plant."); return; }
   sourceFiles = files;
   setActions([["Chọn lại ảnh",pickFiles,true]]);
   androidButton.disabled = true;
