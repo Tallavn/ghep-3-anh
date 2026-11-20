@@ -105,7 +105,9 @@ async function classify(file){
   const key = `cls-v5|${nm}|${file.size}|${file.lastModified}`;
   const cached = await kvGet(key);
   if(cached !== undefined) return cached;
+  const t = performance.now();
   const {text,landscape} = await ocrText(file);
+  timing.ocr += performance.now()-t; timing.ocrCount++;
   // hộp thoại đổi ca ("Confirm the shift?", Dormitory...) cũng có chữ Trading Post: loại hẳn
   if(/confirm\s*the\s*shift|shift\s*change|staffing\s*changes|dormitory/i.test(text)){ await kvSet(key,"none"); return "none"; }
   const hits = ORDER.map(type => ({type,index:text.search(RX[type])}))
@@ -125,7 +127,8 @@ const fileEntries = new WeakMap();
 const DIR_OPEN_MAX = 40;
 async function listDir(h,out=[]){
   for await (const e of h.values()){
-    if(e.kind==="directory"){ await listDir(e,out); continue; }
+    if(e.kind==="directory") continue;   // không quét thư mục con: trên Android rất chậm
+    if(++timing.listed % 100 === 0) status("Đang đọc danh sách: " + timing.listed + " file…");
     if(!/\.(png|jpe?g|webp|bmp)$/i.test(e.name) || isCollage(e.name)) continue;
     out.push({parent:h,handle:e,time:nameTime(e.name)});
   }
@@ -136,11 +139,18 @@ async function openEntry({parent,handle}){
   fileEntries.set(file,{parent,handle});
   return file;
 }
+const timing = {listed:0,list:0,open:0,ocr:0,ocrCount:0};
 async function filesFromDir(h){
+  Object.assign(timing,{listed:0,list:0,open:0,ocr:0,ocrCount:0});
+  let t = performance.now();
   const entries = await listDir(h);
+  timing.list = performance.now()-t;
+  t = performance.now();
   const timed = entries.filter(x => x.time !== null).sort((a,b) => b.time-a.time).slice(0,DIR_OPEN_MAX);
   const untimed = entries.filter(x => x.time === null);   // tên không có giờ: phải mở để lấy ngày sửa
-  return Promise.all([...timed,...untimed].map(openEntry));
+  const files = await Promise.all([...timed,...untimed].map(openEntry));
+  timing.open = performance.now()-t;
+  return files;
 }
 
 /* ====== quy trình chính ====== */
@@ -244,6 +254,7 @@ async function run(files,{forSharing = false} = {}){
     updateDeleteButton();
     ORDER.forEach((key,i) => log(key.toUpperCase() + " ← " + (group[i] ? group[i].name : "THIẾU ẢNH"), group[i] ? "ok" : "er"));
     status(lastAlert ? "Xong. ⚠ CẢNH BÁO: " + lastAlert : "Xong.");
+    if(timing.listed) log("Thời gian: đọc tên " + timing.listed + " file " + (timing.list/1000).toFixed(1) + "s · mở file " + (timing.open/1000).toFixed(1) + "s · nhận dạng " + timing.ocrCount + " ảnh mới " + (timing.ocr/1000).toFixed(1) + "s");
     return true;
   } catch(e){ status("Không thể tạo ảnh: " + e.message); }
   finally { busy = false; }
