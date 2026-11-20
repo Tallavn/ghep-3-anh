@@ -48,6 +48,8 @@
     <input id="setMorale" type="number" min="1" max="100" step="1"> %</label>
   <small>Lưu trong trình duyệt này. Tasker có thể ép mốc qua link: <code>ghep_3_anh_2.html?canhbao=50</code></small>
   <label><input id="setAutoDownload" type="checkbox"> Tự tải ảnh về sau khi ghép</label>
+  <label>Buff CC cho Factory <input id="setCcFactory" type="number" min="0" max="100" value="0"> %</label>
+  <label>Buff CC cho Trading Post <input id="setCcTrade" type="number" min="0" max="100" value="0"> %</label>
   <small>Tắt thì chỉ hiện nút Chia sẻ / Lưu ảnh, không tự tải. Mặc định tắt trên điện thoại.</small>
   <label><input id="setDeleteOriginals" type="checkbox"> Cho phép xoá ảnh gốc sau khi ghép</label>
   <small>Áp dụng cho ảnh đọc từ thư mục. Hãy lưu ảnh ghép trước khi xoá.</small>
@@ -332,14 +334,14 @@ const TP_PCT = {
 };
 /* names: operator đang làm việc trong phòng; ahAll: số Abyssal Hunter đang làm ở mọi Factory.
    Trả {pct, unknown}: unknown = người không có trong bảng (không cộng %). */
-function roomPct(room, names, ahAll){
+function roomPct(room, names, ahAll, cc = 0){
   const lv = ROOM_LV[room], has = n => names.includes(n);
   const innate = names.length >= lv ? lv : 0;
   const unknown = [];
   if(room[0] === "F"){
     const c = {rt:names.filter(n=>RT.includes(n)).length, std:names.filter(n=>STD.includes(n)).length};
     if(has("Weedy"))   // Automation: huỷ % người khác (trừ Purestream), +15%/PP
-      return {pct: innate + 15*BASE.pp + (has("Purestream") ? FAC_PCT.Purestream() : 0),
+      return {pct: innate + cc + 15*BASE.pp + (has("Purestream") ? FAC_PCT.Purestream() : 0),
               unknown: names.filter(n => n!=="Weedy" && n!=="Purestream" && !FAC_PCT[n] && !AH_OPS.includes(n))};
     let normal = 0, ah = 0, waai = 0;
     for(const n of names){
@@ -351,7 +353,7 @@ function roomPct(room, names, ahAll){
     ah = Math.min(ah, 90);
     // Waai Fu: +5% cho mỗi 5% "thường" của người khác (không tính AH, Purestream), tối đa 40%
     const copy = Math.min(40, Math.floor((normal - (has("Purestream") ? FAC_PCT.Purestream() : 0))/5)*5);
-    return {pct: innate + normal + ah + waai*Math.max(0,copy), unknown};
+    return {pct: innate + cc + normal + ah + waai*Math.max(0,copy), unknown};
   }
   if(has("Shamare")){   // huỷ % người khác, +45%/người; % hiệu quả theo bảng guide (TP cấp 3)
     const teq = has("Tequila"), bib = has("Bibeak") || has("Kafka");
@@ -365,9 +367,9 @@ function roomPct(room, names, ahAll){
   }
   if(has("Proviso")){   // Proviso E2 đổi đơn 2-3 vàng: (100 + % khác + nội tại) × hệ số − 100
     const mult = lv === 2 ? 1.811073 : 1.551724;
-    return {pct: Math.round((100 + raw + innate)*mult - 100), unknown};
+    return {pct: Math.round((100 + raw + innate + cc)*mult - 103 - cc), unknown};
   }
-  return {pct: raw + innate, unknown};
+  return {pct: raw + innate + cc, unknown};
 }
 /* chữ ký chân dung 16x12 RGB của từng nhân vật, lấy từ ảnh 17/11 0h (Team 1) và 5h (Team 2) */
 const OPS = {
@@ -699,20 +701,24 @@ async function compose(list){
     const stdNames = room => COMBO[team][room].map(g => [].concat(g)[0]);
     const ahStd = ahOf(ROOM_IDS.fac.map(stdNames));
     for(const x of roomSlots){
-      const cur = roomPct(x.room, working(x), ahNow), std = roomPct(x.room, stdNames(x.room), ahStd);
+      const field = $(x.room[0] === "F" ? "setCcFactory" : "setCcTrade");
+      const cc = Math.max(0, Math.min(100, Number(field.value) || 0));
+      const cur = roomPct(x.room, working(x), ahNow, cc), std = roomPct(x.room, stdNames(x.room), ahStd, cc);
       const low = cur.pct < std.pct, unk = cur.unknown.length > 0;
-      const color = low ? LINEUP_COLOR : MARK_COLOR;
-      const bx = M+RW+RG + (SLOT.x + 3*SLOT.pitch + 10)*s, bw = (REF.x1-REF.x0 - SLOT.x - 3*SLOT.pitch - 24)*s;
-      const by = sections[x.i].y + x.r*(TH+GAP) + 14*s, bh = TH - 28*s;
+      const isFactory = x.room[0] === "F";
+      const efficiency = isFactory
+        ? (cur.pct > 100 ? "good" : cur.pct > 90 ? "normal" : "low")
+        : (cur.pct > 200 ? "excellent" : cur.pct > 120 ? "good" : "normal");
+      const color = efficiency === "low" ? LINEUP_COLOR
+        : efficiency === "normal" ? "#d4d8de" : MARK_COLOR;
+      const bx = M+RW+RG + 94*s, bw = 100*s;
+      const by = sections[x.i].y + x.r*(TH+GAP) + 145*s, bh = 44*s;
       g.save();
-      g.fillStyle = "rgba(13,17,23,.82)"; g.strokeStyle = color; g.lineWidth = 3;
-      g.beginPath(); g.roundRect(bx,by,bw,bh,14); g.fill(); g.stroke();
+      g.fillStyle = "#555";
+      g.fillRect(bx,by,bw,bh);
       g.textAlign = "center"; g.textBaseline = "middle";
-      g.fillStyle = color; g.font = "800 66px " + FONT; g.letterSpacing = "-1px";
-      g.fillText(cur.pct + "%" + (unk ? "?" : ""), bx+bw/2, by+bh*0.42);
-      g.letterSpacing = "0px";
-      g.fillStyle = "#c3cad5"; g.font = "600 21px " + FONT;
-      g.fillText(unk ? "có người lạ · chuẩn " + std.pct + "%" : low ? "chuẩn " + std.pct + "%" : "đúng combo", bx+bw/2, by+bh*0.8);
+      g.fillStyle = color; g.font = "800 28px " + FONT;
+      g.fillText(cur.pct + "%" + (unk ? "?" : ""), bx+bw/2, by+bh/2, bw-8*s);
       g.restore();
       g.letterSpacing = "0px"; g.textAlign = "left"; g.textBaseline = "alphabetic";
       log(ROOM_NAME[x.room] + ": " + cur.pct + "% (chuẩn Team " + team + ": " + std.pct + "%)" + (unk ? ", không có số cho: " + cur.unknown.join(", ") : ""), low ? "er" : "ok");
