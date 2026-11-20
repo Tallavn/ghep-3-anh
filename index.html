@@ -1,0 +1,878 @@
+﻿<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ghép 3 ảnh CC · Factory · Trade</title>
+<style>
+  :root{--bg:#14161a;--card:#1d2026;--tx:#e8eaee;--mut:#8b92a0;--ac:#4f9dff;--ok:#3ecf8e;--er:#ff6b6b}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.5 system-ui,"Segoe UI",sans-serif;padding:16px;display:flex;flex-direction:column;align-items:center;gap:14px}
+  h1{font-size:18px;margin:4px 0 0}
+  .row{display:flex;gap:10px;flex-wrap:wrap;justify-content:center}
+  button,.btn{background:var(--ac);color:#fff;border:0;border-radius:10px;padding:11px 18px;font-size:15px;font-weight:600;cursor:pointer}
+  button.sec,.btn.sec{background:var(--card);color:var(--tx);border:1px solid #30343d}
+  button:disabled{opacity:.45;cursor:default}
+  #status{color:var(--mut);text-align:center;min-height:22px}
+  #log{width:min(720px,100%);background:var(--card);border-radius:10px;padding:10px 14px;font-size:13px;color:var(--mut);max-height:150px;overflow:auto;display:none}
+  #log div.ok{color:var(--ok)} #log div.er{color:var(--er)}
+  #out{max-width:min(720px,100%);height:auto;border-radius:8px;display:none;box-shadow:0 6px 30px #0008}
+  input[type=file]{display:none}
+  #settings{width:min(720px,100%);background:var(--card);border-radius:10px;padding:10px 14px;color:var(--mut)}
+  #settings summary{cursor:pointer;color:var(--tx);font-weight:600}
+  #settings label{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px}
+  #settings input[type=number]{width:76px;background:var(--bg);color:var(--tx);border:1px solid #30343d;border-radius:8px;padding:6px 8px;font-size:15px}
+  #settings small{display:block;margin-top:6px}
+</style>
+</head>
+<body>
+<h1>Ghép ảnh Control Center · Factory · Trade</h1>
+<div class="row" id="actions"></div>
+<button id="btnAndroidShare" hidden>Ghép 3 ảnh và chia sẻ</button>
+<div id="status">Đang khởi động…</div>
+<canvas id="out"></canvas>
+<div class="row" id="resultBtns" style="display:none">
+  <button id="btnSave">Lưu ảnh</button>
+  <button id="btnShare" class="sec">Chia sẻ</button>
+  <button id="btnCopy" class="sec">Copy</button>
+  <button id="btnRe" class="sec">Tạo lại</button>
+  <button id="btnDeleteOriginals" class="sec" hidden>Xoá ảnh gốc</button>
+</div>
+<div id="log"></div>
+<details id="settings">
+  <summary>Cài đặt</summary>
+  <label>Báo động khi morale của nhân vật được khoanh dưới
+    <input id="setMorale" type="number" min="1" max="100" step="1"> %</label>
+  <small>Lưu trong trình duyệt này. Tasker có thể ép mốc qua link: <code>ghep_3_anh_2.html?canhbao=50</code></small>
+  <label><input id="setDeleteOriginals" type="checkbox"> Cho phép xoá ảnh gốc sau khi ghép</label>
+  <small>Áp dụng cho ảnh đọc từ thư mục. Hãy lưu ảnh ghép trước khi xoá.</small>
+</details>
+<input type="file" id="fileIn" accept="image/*" multiple>
+<input type="file" id="androidFileIn" accept="image/*" multiple>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script>
+"use strict";
+/* ====== cấu hình ====== */
+const MAX_SCAN   = 120;     // tối đa số ảnh mới nhất được xét
+const OUT_WIDTH  = 1289;   // độ rộng PNG
+const ORDER      = ["cc","fac","trade"];
+const RX = {
+  cc:    /control\s*c[e3]nter|trung\s*t[aâ]m\s*[dđ]i[eề]u\s*khi[eể]n|控制中枢/i,
+  fac:   /factory|manufactur|nh[aà]\s*m[aá]y|制造站/i,
+  trade: /trad(e|ing)\s*post|\btrade\b|trading|giao\s*d[iị]ch|贸易站/i
+};
+const $ = id => document.getElementById(id);
+const status = t => $("status").textContent = t;
+const log = (t,c) => { const l=$("log"); l.style.display="block"; const d=document.createElement("div"); if(c)d.className=c; d.textContent=t; l.appendChild(d); l.scrollTop=l.scrollHeight; };
+
+/* ====== IndexedDB nhỏ: nhớ thư mục + cache phân loại ====== */
+const idb = new Promise(res=>{
+  const r = indexedDB.open("ghep3anh",1);
+  r.onupgradeneeded = ()=>{ r.result.createObjectStore("kv"); };
+  r.onsuccess = ()=>res(r.result);
+  r.onerror = ()=>res(null);
+});
+async function kvGet(k){ const db=await idb; if(!db) return; return new Promise(r=>{const q=db.transaction("kv").objectStore("kv").get(k); q.onsuccess=()=>r(q.result); q.onerror=()=>r();}); }
+async function kvSet(k,v){ const db=await idb; if(!db) return; return new Promise(r=>{const t=db.transaction("kv","readwrite"); t.objectStore("kv").put(v,k); t.oncomplete=()=>r(); t.onerror=()=>r();}); }
+
+/* ====== OCR ====== */
+let worker=null;
+async function getWorker(){
+  if(worker) return worker;
+  status("Đang tải bộ nhận dạng chữ (lần đầu hơi lâu)…");
+  try{ worker = await Tesseract.createWorker(["eng","vie"]); }
+  catch(e){ worker = await Tesseract.createWorker("eng"); }
+  return worker;
+}
+async function ocrText(file){
+  const bmp = await createImageBitmap(file);
+  const landscape = bmp.width > bmp.height;
+  const s = Math.min(1, 1600/bmp.width);
+  const c = document.createElement("canvas");
+  c.width = Math.round(bmp.width*s); c.height = Math.round(bmp.height*s);
+  c.getContext("2d").drawImage(bmp,0,0,c.width,c.height);
+  bmp.close && bmp.close();
+  const w = await getWorker();
+  const { data } = await w.recognize(c);
+  return {text:data.text || "",landscape};
+}
+
+/* ====== phân loại 1 ảnh: cc | fac | trade | combined | none ====== */
+async function classify(file){
+  const nm = file.name;
+  if(isCollage(nm)) return "combined";
+  const key = `cls-v5|${nm}|${file.size}|${file.lastModified}`;
+  const cached = await kvGet(key);
+  if(cached !== undefined) return cached;
+  const {text,landscape} = await ocrText(file);
+  // hộp thoại đổi ca ("Confirm the shift?", Dormitory...) cũng có chữ Trading Post: loại hẳn
+  if(/confirm\s*the\s*shift|shift\s*change|staffing\s*changes|dormitory/i.test(text)){ await kvSet(key,"none"); return "none"; }
+  const hits = ORDER.map(type => ({type,index:text.search(RX[type])}))
+    .filter(hit => hit.index >= 0).sort((a,b) => a.index-b.index);
+  const type = !landscape && hits.length > 1 ? "mixed" : (hits[0]?.type || "none");
+  await kvSet(key,type);
+  return type;
+}
+
+/* ====== lấy danh sách file ====== */
+let sourceFiles = null;   // File[] khi chọn tay (điện thoại)
+let dirHandle = null;     // thư mục (máy tính)
+const fileEntries = new WeakMap();
+
+// Bước 1: chỉ liệt kê tên (nhanh). Bước 2: chỉ mở file mới nhất theo giờ trong tên.
+// Trên Android mở từng file (getFile) qua bộ nhớ hệ thống rất chậm, nên không mở hết thư mục.
+const DIR_OPEN_MAX = 40;
+async function listDir(h,out=[]){
+  for await (const e of h.values()){
+    if(e.kind==="directory"){ await listDir(e,out); continue; }
+    if(!/\.(png|jpe?g|webp|bmp)$/i.test(e.name) || isCollage(e.name)) continue;
+    out.push({parent:h,handle:e,time:nameTime(e.name)});
+  }
+  return out;
+}
+async function openEntry({parent,handle}){
+  const file = await handle.getFile();
+  fileEntries.set(file,{parent,handle});
+  return file;
+}
+async function filesFromDir(h){
+  const entries = await listDir(h);
+  const timed = entries.filter(x => x.time !== null).sort((a,b) => b.time-a.time).slice(0,DIR_OPEN_MAX);
+  const untimed = entries.filter(x => x.time === null);   // tên không có giờ: phải mở để lấy ngày sửa
+  return Promise.all([...timed,...untimed].map(openEntry));
+}
+
+/* ====== quy trình chính ====== */
+const SESSION_MS = 5 * 60 * 1000;
+const isCollage = name => /^(?:ghep_|gridart_)|gh[eé]p|combined|merged/i.test(name);
+const identity = f => [f.name,f.size,f.lastModified];
+let lastScan = "";
+let lastResult = "";
+let busy = false;
+let resultFiles = [];
+let scannedFiles = [];
+let directoryScanVersion = 0;
+let deleteOriginalsEnabled = false;
+function updateDeleteButton(){
+  $("btnDeleteOriginals").hidden = !deleteOriginalsEnabled || !resultFiles.length;
+}
+
+function nameTime(name){
+  const match = name.match(/(?:^|\D)(20\d{2})[-_]?(\d{2})[-_]?(\d{2})[T_ -](\d{2})[:._-]?(\d{2})[:._-]?(\d{2})(?!\d)/);
+  if(!match) return null;
+  const [,year,month,day,hour,minute,second] = match.map(Number);
+  const date = new Date(year,month-1,day,hour,minute,second);
+  return date.getFullYear() === year && date.getMonth() === month-1 && date.getDate() === day &&
+    date.getHours() === hour && date.getMinutes() === minute && date.getSeconds() === second
+    ? date.getTime() : null;
+}
+function captureTime(file){ return nameTime(file.name) ?? file.lastModified; }
+
+function clearResult(){
+  resetAndroidShare();
+  $("out").style.display = "none";
+  $("resultBtns").style.display = "none";
+  delete $("out").dataset.name;
+  lastResult = "";
+  resultFiles = [];
+  updateDeleteButton();
+}
+
+function recentCandidates(files){
+  return files.filter(f => !isCollage(f.name) &&
+      (f.type.startsWith("image/") || /\.(png|jpe?g|webp|bmp)$/i.test(f.name)))
+      .map(file => ({file,time:captureTime(file)}))
+      .sort((a,b) => b.time-a.time || b.file.name.localeCompare(a.file.name))
+      .slice(0,MAX_SCAN);
+}
+
+async function run(files,{forSharing = false} = {}){
+  if(busy) return;
+  busy = true;
+  try {
+    const candidates = recentCandidates(files);
+    const signature = JSON.stringify(candidates.map(({file}) => identity(file)));
+    if(!forSharing && signature === lastScan) return;
+    $("log").innerHTML = "";
+    if(!candidates.length){ clearResult(); status("Không có ảnh phù hợp."); return; }
+    if(typeof Tesseract === "undefined"){ status("Không tải được OCR. Kiểm tra mạng rồi tải lại trang."); return; }
+
+    // chỉ xét PHIÊN MỚI NHẤT (các ảnh CC/Factory/Trade trong 5 phút tính từ ảnh hợp lệ mới nhất).
+    // Thiếu loại nào vẫn xuất ảnh, phần thiếu ghi lỗi (không lùi về phiên cũ hơn).
+    const recent = [];
+    let hadError = false, newest = null, group = null;
+    for(const [index,item] of candidates.entries()){
+      if(newest !== null && newest - item.time > SESSION_MS) break;
+      status("Đang lọc ảnh " + (index+1) + "/" + candidates.length + "…");
+      let type;
+      try { type = await classify(item.file); }
+      catch(e){ log("Lỗi " + item.file.name + ": " + e.message,"er"); hadError = true; continue; }
+      if(type === "mixed"){ log("Bỏ qua (lẫn nhiều loại): " + item.file.name,"er"); continue; }
+      if(!ORDER.includes(type)) continue;
+      if(newest === null) newest = item.time;
+      recent.push({...item,type});
+      group = ORDER.map(key => recent.find(entry => entry.type === key)?.file || null);
+      if(group.every(Boolean)) break;
+    }
+    if(forSharing && !group?.every(Boolean)){
+      clearResult();
+      status("Cần đủ 3 ảnh cùng phiên: Control Center, Factory và Trade.");
+      return;
+    }
+    if(!hadError) lastScan = signature;
+    if(!group){
+      clearResult();
+      status(hadError ? "Có lỗi đọc ảnh hoặc tải OCR. Kiểm tra mạng rồi quét lại." : "Không thấy ảnh Control Center / Factory / Trade nào.");
+      return;
+    }
+    const result = JSON.stringify([group.map(f => f ? identity(f) : null),MORALE_ALERT]);   // đổi mốc thì xuất lại
+    if(result !== lastResult){
+      resetAndroidShare();
+      resultFiles = [];
+      updateDeleteButton();
+      status("Đang ghép…");
+      await compose(group);
+      lastResult = result;
+      if(!forSharing && await kvGet("last-download") !== result){
+        await download();
+        await kvSet("last-download",result);
+      }
+    }
+    scannedFiles = files;
+    resultFiles = group.filter(file => file && fileEntries.has(file));
+    updateDeleteButton();
+    ORDER.forEach((key,i) => log(key.toUpperCase() + " ← " + (group[i] ? group[i].name : "THIẾU ẢNH"), group[i] ? "ok" : "er"));
+    status(lastAlert ? "Xong. ⚠ CẢNH BÁO: " + lastAlert : "Xong.");
+    return true;
+  } catch(e){ status("Không thể tạo ảnh: " + e.message); }
+  finally { busy = false; }
+}
+
+/* ====== ghép ảnh (kiểu Color Rail) ====== */
+const COLORS = {cc:"#e8ecf1", fac:"#ffc400", trade:"#19a7ff"};
+const RAIL_TEXT = {cc:"#0f1218", fac:"#0f1218", trade:"#ffffff"};
+const RAIL_NAME = {cc:"CONTROL", fac:"FACTORY", trade:"TRADING"};
+/* vị trí đầu mỗi hàng phòng trong ảnh chụp (đơn vị tham chiếu ảnh rộng 2576) */
+const ROW_TOPS = {cc:[195], fac:[153,409,666,925], trade:[228,484,742]};
+const REF = {x0:1212, x1:2428, h:204, w:2576};
+const FONT = '"Inter","Segoe UI",system-ui,-apple-system,sans-serif';
+
+/* ====== khoanh nhân vật theo ca (0h Proviso, 8h Shamare, 16h Tequila) ====== */
+const MARK_COLOR    = "#3ddc84";   // màu vòng khoanh khi morale ổn
+const ALERT_COLOR   = "#ff2b2b";   // màu vòng + băng báo động khi morale thấp
+const LINEUP_COLOR  = "#ff9f1a";   // màu vòng + băng khi sai đội hình
+let   MORALE_ALERT  = 0.60;        // mặc định 60%; chỉnh ở Cài đặt hoặc ?canhbao=NN
+let lastAlert = "";
+const MARK_BY_HOUR  = {0:"Proviso", 8:"Shamare", 16:"Tequila"};   // giờ chụp ±60 phút
+const MATCH_MAX     = 0.25;        // so chân dung đã chuẩn hóa: cùng người <=0.08, khác người >=0.47
+
+/* ====== combo đội hình (Figma 20/11/2026). Bỏ qua thứ tự ô; [A,B] = A hoặc B đều được. CC không kiểm. ====== */
+/* lịch: 0-5h Team 1, 5-8h Team 2, 8-13h Team 1, 13-16h Team 2, 16-21h Team 1, 21-24h Team 2 */
+const TEAM_BY_HOUR = h => (h<5 || (h>=8 && h<13) || (h>=16 && h<21)) ? 1 : 2;
+const COMBO = {
+  1:{F1:["Weedy","Purestream"], F2:["Dorothy","Silence the Paradigmatic","Fartooth"], F3:["Bryophyta","Thorns the Lodestar","Gravel"], F4:[["FEater","Conviction"]],
+     T1:["Proviso","Mr. Nothing"], T2:["Tequila","Shamare",["Bibeak","Kafka"]], T3:["Lemuen","Exusiai","Vigil"]},
+  2:{F1:["Rosmontis","Waai Fu"], F2:["Specter","Gladiia","Mizuki"], F3:["Skadi","Andreana","Haze"], F4:[["Conviction","FEater"]],
+     T1:["Proviso","Underflow"], T2:["Tequila","Shamare",["Bibeak","Kafka"]], T3:["Ebenholz","Siege","Morgan"]}
+};
+const ROOM_IDS  = {fac:["F1","F2","F3","F4"], trade:["T1","T2","T3"]};
+const ROOM_NAME = {F1:"Factory 1",F2:"Factory 2",F3:"Factory 3",F4:"Factory 4",T1:"Trading Post 1",T2:"Trading Post 2",T3:"Trading Post 3"};
+/* chữ ký chân dung 16x12 RGB của từng nhân vật, lấy từ ảnh 17/11 0h (Team 1) và 5h (Team 2) */
+const OPS = {
+  "Weedy":"JycnJiYmJiYmJiYmJiYmJicnJiYmJScoKCwzOzw8Pj47JSYlJiYmJiYmJiYmJycnICAgICAgICAgICAgJSYnICEjIyQlOj9MLjNIJSYmGxsbHx8fIB8fICAgICAgICAgHR0dHR0dHR0dHR0dISMkHiIlPkNNQkRGNDc8LzI5Jys1ISIjHR0dHR0dHR0dHR0dGxsbGxsbGxsaGxscODo8X19lR0lNWlVOWFdfZV9fZmZlQkNGIiIlGhoaHR4eGx0dGhoaGRkZGhoaRUVHbWtuaGhsf358f35+f39/enZ1Yl1gb2tqV1RZKCkpJystMTE0GRkZHR4gRkdOeHV0dnJwf3x5fndzf3dzf3h0fXdzf3l1eW1ne3NuV1RcRUFPIiMqGBkZJjVIcW9vfXZyfnZxfHNtfnZxf3h0f3dydWNcfnJsfHFtfnVwYFtdTEpbQTtSGx0fVFBPfHRvemxmfnVudWJXf3dyfnhze29oaFBDfXBpdmFYe3FtdWhfS0VLISE2Mi8sUUhOeXFsempjeWVbZ05Ad2VcfG5mc19SVDIoWDkublRHeGNWfW1kWVBJHBwfHx4dPTtLdmlkd2FYWkA4Wi0kdmNWfG5efnZpdUc5elpMd2BWdmNYcF9WOjErSUlVGBgYHx4eY1BIdmJZcVtOe15RfXJnfnRmfnVmfnRkdWVYbF9UbGBVcGVaXFBIHR4ePj1GIiIrT0JBcFVJcl9UfXNlfXJkemtdeGZZfXFjfG5dZ1VHV1FQQD08cmVZbGJW",
+  "Purestream":"JycnJiYmJiYmJiYmJiYmJyYmRUFBdXNzfXx7bl1cVyIhTh0aTR8cWExIJiYmJycnICAgICAfICAgICAfLCkpYl5efn19fn18W09MOhcWXBcVWRkXVBkWXz47JyQkICAgHR0dHR0dIB0eS0dHd3Nyfnt4fXx7Y2JiIR8rIRwlVyorWxsYVBcTXTs2Ojc2HR0dHBsbNS0ubWdnc2pmenRtfn17cG1rLis9LSw8JyIyHxYoPSQwSxkWWjgzRkNCGxsbVEtLc2xqdm5qe3hxdnVxenl2TUFEPzdAVlNZU1BSX1xeVE1VNyYzUjo4SkhIGhkaYUhCcGRef396bGdVYVpPUEpNHhIbJhceJhgiNysyJBomOjQ+Y15hW1VXS0hHGRkZVSwlfnt2f353b21lY19eJRUeLRwmNB8nNBwnLxooLRknJRYjNi84YFtcUkxLGBgYaFhSf3x1f3x1dHNvNyYsPyovTz07c11VVzg4UTM3Siw0NSEuLB0uNy83YFxbIR4eeXRufnp0fntzVEVHPycrUEE8S0E7cmdgZ01GZ0ZBWjg4RC4zOiMyQS85TUdIPDo5fHZwfnpsXFNSVz5CVUJAUktMSEdLc2lhdF9Ud2lhdGRbYUdERCw2QC47XVZXV1ZUenVoaWJXNicuWT1BbV9ad25lenRtfXlwfXlxXFZSOzIuZVJLVDg+UjlGWk1NbWdlbmpgHxsbMSMvUzc8dWlie3NrfHVse3VsenNqaWFaZ2VnWkVCUzM7VEBHYkxJaFlX",
+  "Fartooth":"JycnJycnJycnJycnJycnJycnJycnJycnJycnKCcmOzo2JiYlISEhJycnJycnJycnICAgICAgICAgICAgIiEgJSMgKSQgNjArTkhCLywoJyUiKyklGxwbGxsbICAgICAgHR0dHR0dIB8eIR8dLygkQjw3V1NMYlpVQDwyKigiLywoIiEdHh0ZHBwZGxsbHR0dGxsbGxsbOzYxXlFHXlVNUEtFUUxFQz42V1RPQD46KSgkLSwoMC0kGhkWEhISGxsbHRwbUk5Ja2NeY15YZFxWX15ZTUdARD83XGBbWFdTOzk2JiUhNzQsGBcTGhoaGhoaUkhCYVtTb2hjamNhZ2RhY2VjVUxEVE9KUU1HR0Q/S0lEPTo2NDIsFhYSJiUhFhYVYFdPcG1oaWRhc29sbm1sWlpWbVtQempfd2thbmRbU01FRkM+Ozk1Hx8bGxsZIyIfbGJaY1pUWlNOYVtXZl5baV9Yfm9ie3FndGpgcmRaa2NaTUpDS0tGOzo1NzYxMiwnU0tCWVVPU0xFWldSWVZPZl9ZfG9kdGlgVEI3RzgsYFJLQD45ODczRkU+U0U+QzozPTguUEtEVk5IV1ZPVlRKZllSal1WeXBncGpfcmhdeXJpSkpFUUdAU0hAQ0A5REI9JSIdWlJKZGBaRkU5R0M8RTguamJZc2phdm5mfXZtfHZtYmFcW1JLV09JQUE8Pjo1JiEcXVVNTUg+NjUtSEM9ZldOe25kfnZsfndufndufnduYVhRTEdAXV5XSUhEPTw3",
+  "Silence the Paradigmatic":"LCwrKCgoJycnJycnJycnJycnJycnLSwrMzMxJycnJycnJycnJycnJycnJycnJycnHx8fMC8tRkVBJSUjICAgICAgISAgHx8fQD47Hx8fICAgICAgICAgICAgICAfICAgIiEgGxoaJiYlXVlQWFVPNzQyNDAsNjArNC4pNjIvMTAuHR0dIyMiOTczPTs2ISEgHBgYNi8qLyciIx4dVlNMdHRtZWJeZF9ZaF9VYllPW1NMUlFMdnZtTElDISEgGhsbGxoZLCcjQjkzMywoIx0bKyUhRkE8U1FLW1JHXVNJUE5KUVFPXVpUPTs4T0xIOjYyIiEhLSkmLyckJyAdLiYjLyYkMiomPDQvS0I7SD44MisnKyckPTcyS0ZCSkI9JSEfGRkZJiQhMComLyYiMiokNy0nLiUhKyMhKyMhKSEfJB8dMCkmKSQhVlJNKyclFBQUGRkZOjUxJyAdLyUiNiskRjgtUEY/MigjMCciNislSkA6MSkkLCUhQkA7GBgXGBgYKScmKyUiIxwaKiIgNSsmOTEqTUU+LSUfLiQeMCchYlxUKyUhJB8dLispIB4eGRkZLSckIhwaHRcWJR4cNC0pQjctSDswTEQ8KyEcRD01NSsiMysmJB4bJyQjIR4dGRkZNy4pJx8eHBYVJB0bXVRMdWhaeGxecmleaV5VZV5TbFpIW1FJJBsaKykoIh0dFxcXNS4nLSUiIBoYKCIfUkpEfHRofHRpfXVqfHRqfHRoe3BlTUU/HxwbIyIiKyUkFhYW",
+  "Dorothy":"JycnJycnKCgnWko4aVdCbFtIbVxKbF1Nf39/VFJRLS0tJycnJycnJycnJycnJycnICAgOjo6SEhIQ0JBV05EZlVDaFVBaFZCeXNtY1hLa2dkRUVFICAgICAgICAgICAgRkVDWFVVdXR2f39/enp6aGZqXk9AXko2Yk86YE47amFZf39/bGxsOjo6HR0dHR0dfXt5bmJSZFVCZVpNcmxnYlREZVE6ZlI+cGRXaFhFX04+fHx8fHt8f39/VlZWHBwca1tFaltHXUw2Y1E6ZVM9bFlEb15Kc2dZdm1idWxiaVhHfHt8fXx9fn5+fn1+Xl1baFU/ZllNXk46a1lCblxGbl1Lb19McmFOc2FOcmRUcmNRbWJWfXx8f39/fn19e3VqV1NUXVRPXk03bVtFb15JcmBNb11Kbl1KcmBLcF5JbVpGaFpOcnFyf39/f39/fXx8aGVoYVdOZlM6b11GcF5Jb1xIcV9Kb1xIbFpEcF1HblpCbmdgf35+f39/fn5+fn5+aWZpYFVMa1hAbVpDcF1GcFxFa1pFZldHYk85ZVA6bFY+a1dBbF5OdHBrfX1+fn5+aWdqZlxTaFM5ZlM8a1Y+a1U8aVQ/dGZeZlZPXEk8ZU83a1M6b1c9ZU84bGZhfX19YmFiZV9ZYFA9Ykw1Y1JFXkk1XkYwYlJFdGpicVtGZUw5b1U7aFE4ZlI+bV9TamJcV1VWWlRPZmFeWUQtVj8tYlBBb2ZbeXNufXZxcmRYalI6ZksyYkkxZVdIbGVgW1BJ",
+  "Bryophyta":"JiYmJiYmJiYmJiYmJiYmJSUlJSUlJSUlJSUlJiYmJiUlJyYmJycnJiYmJSUlJiYmICAgHx8fHx8fHx8fHx8fKCcoExMTGhkZGhkZHh4eHx8fHh4eHR0dICMhHx8fICAgHR0dHR0dHR0dHBwcGBgYEBAQEA8PKiIgJCAfGhkYGhkZGxsbGxsbJywkHR0dHR0dHBsbGRkZIiAgGxoaDw8PCwsKEg8NERIRExMSEREQPDg3NDIyGRkYIisiIiEhGxsbPBkTFhUVDxAQDA0NBAUEBAQEBgsJCw4NDg0MGRUTPjg3MzEwFxgXHi4lLjIwGhkaFhMTFxcXCQkJBQYGAQEBBg4LBw0LDg0MFA4MNSglMigmKignHhsYQDg0Q0NBGBgYGBgYFBQUCQsKBgsKCx0XDh8ZDw8NJRMPHhMQLB0bJhkXGhUUJhsZLCkkHB0cFxcXGBgYDw8PBQgHCBMPEiUeFRgUGBANJRQPFxIPJRsYMSYjIRoZNywqTkpIGxsbGBgYGRkZDhAQAwUFBgYGCwsKEQwKEg0KFRAOKSAdcFhSdGFcMSUiNSooSkZFQkFBGxsbGRkZCwsMBgYGCgwMDAsKDw0MDAwMGxYUTTo1XEM+WEdCPS4qXEU+JiQjHBsbHh4eGRkZFBQUDg4OERISGRUUIx0bMSIgU0A7dV5YZlFNUzw6XEpEUT86EhERFhYWGBgYGRkZGBgYFRUVExYVFxcWPjozTjs1a1JLeGJbd2FaalhTX1FOHiMdJzQvGRoZGBkY",
+  "Gravel":"JiYmJiYmJiYmJiYmLSsqSDk3U0I+UEE+ST47NC8uJiYmLCkpJiYmJiYmJSUlJiYmIyIhRTcySEA+Qzk2bVFIcFNKZUlAc1tRemNac1xUUERAW1BNLisrHx8fHx8fICAgNS4sb2hlcmlnaVVOeGFZeF9WeGFXfWpiempie2picV9YcGpnT0xKHBwcHR0dHR0dPzU0eHVzdW5sYVdSal9Zfm5lf3FpfG1lf3VufXJsbV5YRjo2TUdFGhsbGhoaGxsbKyYkamBcLSknW09KeG1mfXJsf3dxfnZxfnNtfnBoeGBWSjk1HhsaGxsbGRkZGRkZFxcXJyIfHxoZX1BLfGtjd2Ree2dfeF5UdFNIc1NJcVJKaUxEMygmNC0sGBgYGRkZHxwcKR4cMCcjcVJJY0g+b1BHY0Q7bU1EaUlBbE1Eb05EaklASTAqV0I9GBgYGBgYJiAfTDEtVj03cVBHYEc8XUI8UjwzVDgwZkY9TzcvWj82cFNIWTs1a09IIB8fGBgYMisoX0E6aEpDcE9GWEA2UT0yVD0yZE09XkQ6QTAmNyghXEI6XEM8ZUhCOjU0GRkZRDk1akxEak9IcVRMTTYwKyIdLCMdd2VUbVlKSDkvUD40TjkyY0lDX0U/ZlRQISEhXEZAclVMb1dQdVtTaE5GVD8zaE09e2hXemdUd19Na048ZUc+ZEtFb1RNVEA7Hx8eV0M9bFNLcF1XdV9XdVxTcVhIeF5MeGVUdWJQd2NPb1dFZUtCZExFYUtEaEtDLyko",
+  "Thorns the Lodestar":"JiYmJiYmJiYmJiYmJiYmJiYmJiUlJyYmJSUlJiYmJiYmJiYmJiYmJiYmJSUlJiYmICAgHx8fHx8fHx8fJCQjIyIhIiEhIyIjHh0dHx4eHx8gHx8fHx8fHx8fHx8fICAgHR0dISEhHR0dIiEhLCgnTUVDPjc2KCQjJB8eGBYWGBgYHh4eHBwcHBwcHR0dHR0dGxsbLy4uJiUlIyEhSD89SkI/NC0sHxsaIh8dGxgXDg4PExMTGhoaGhoaGhoaGxsbGhoaISAgNTAvNjM2NzMzNi8sKCIhIBsaGBQTFhMSCwsMExMTDxAQGRkZGRkZGRkZGRkZGxoaKCUkNDJEOzY/RTw6IhsaGRUVEQ8PCwoKCwsLFRQVCQsMExMTFxcXGRkZGRkZGhkYGxgfIR8uHhsaHxsaHhoaEA8PFhQTDw4ODQ0NCAkLBwkLDAwNFxcXGBgYGBgYEhEQFBIXEQ8RDw4NGBUTGxcWGhcWKh4cIRYTDQwMCwoLBggJCwwMGRkZGBgYFhciFRQTFRQTERAQFBISFhMTFxEPQS4qMB8cRC0oFxEREAwMDQwNGRocFBQUGBgYFhgnFRQVExISGxgXFRIRHBQSNCIeTDMuVDgyRy8pKhoXHBEPFxEQCwsMFBQUGRkZJSEnFRUXGhYVFxMTJBkWTTYvVz0uVTo0Wj04UTYwVjsuMSMgIxkXICAgGBgYGRkZOzQwJCAeFRMSFhMTNykmWDo1Wj03WTw2WDo1WDs1Ry8pLSIfHRoaFBQUFxcXGRkZ",
+  "Conviction":"JiYmJiYmMCclai4idzEkbTAlXTMrRjUwLy4tNjY2MzMzKioqJiYmJiYmJiYmJiYmICAgHyAfWSQYfiIRfSAReR4ReR4QfCESeTgtaWBeZGJjYF1dQUA+HyAfHyAfICAgHR0dHRwcciERfR0NehsMbRoOWhYPWRYPZRgOaTUrYltZZGNjZ2VjOjk4HR0dHR0dGxsbHRoZbB0OeBoLRBQRDhMeBBgnAxQnAw0dBAsYDRMhW1pbXVxbYF9fHx8fGxsbGhoaGRkZLR0aIhohAxotBiU2AxsuAg8gAQwbAhMlAREjFBwuQUNHZWRkQEBAGBkZGBgZEhgeEx0oAg0eAQwdAA0gAQweAQsdAQweAwoYAQwcAQ4lAQ4mQD9BW1hSFRYXExgeDiw6BR45AQwgAQ4kAQ0hHBcbNyciIB0hWTolAQwdAwcSAg4iChYhTjwgMjAqFBMTDAsOAQcYAQwgARM6GBwmdVo8Xkk0Z041VUY2HB8kZ0MoCxIgAg4eGh4fVFFJNCsXNzAYAgQNGhkdGTBFKzg+SD41OjMvVkIuZVdEZ1dCfmFBISAmAQ0eMDYuOTIdT0YmIh0RDQ0QX0k2XU48NlFRWEkzWks+eGhRfmxSd2JHblpBPSsiAxMkHCMcQzkZJiQhHRoVOTIWRTkvdV5FeGlPemxRe2xUf2xSe2hPY1M9aVU6PikdBRMkERYWJSAUGhkXGhoXIB4cBwcKNi0kfGlNcF5IRTkzdWhUdmdPXFI/WUQuDQwUARElODcfRjsa",
+  "Proviso":"MTIvJiYmJiYmLS0sNTU1amxoXF1ZKCknQEc6T1VLLCwsJiYmJiYmJiYmJiYmJiYmPUM4MjMvIyMjICAgRUVEUFROb3BsICAfTE1GWFpRQkNBICAgICAgICAgICAgICAgMDUsNDsvREdAOjo4a2hmXF1XSkxCREY/UlRNYGFbVlhRHx8fHR0dHR0cHR0dHR0dKiwkNTstWFtSVFdPT1FHYmNdbGxnVFVPWltTXF5TSU1CUVNLNTUzGhoaGxsbGxsbFhYWLy8tZWVgVlhPTVBHSEtEamllbW1pY2NccHFiX2FXQEU6S1BGNDQyGRkZGhoaGRkZR0hDQkc8TVFCUlVKZmdhZ2diZGVfaWlhbG1dYWJZWVtRP0U4SE1DIyMhGRkZOjs3Q0o/PUM4X2JSXmBYYGBaaWplWlxTbGdgWFZIVFVKXmBXSU1ASE1AQEI9GBgYQUU7PEM3PEE4RUo9WFtQW1xVUlVKYF5Se3RtXllPPz0zW1xSS1BEUVVIRktAGRkZSE5FWVlTeHZyW1xTV1lQQEI4ZWFUbGZcaGVgYF9cP1BaTlBFTFBDTlJHOkE0JicmV046Y1EtcGdNWVtTR0pCPUA+WVlUW1dOWFVRfXl0a2dhTlFFNzowT1RIOD8zJygmbmxocG5qbGpmQkg8UlVLV19lbG1rZ2Nec25oaWRdb2tjSEg7RUk9S1BDNDovIyQieGY3dV4mYlQtOUAzTU9EY15YaGNbe3VueXJse3RucmtjTUw+SE1ANDkvJyokGhsa",
+  "Mr. Nothing":"Sjo6RCsuJh0lISMqJicvJigyJCcvHyInGx4iGRseGhwfHyAkIyIqISEpFxgeExYadGpnRiElHg8XDRceEhYbEhMXFBUbGBoeFhgfFBYbExMYEhQZGxwlGx4oFhkjEhMYYFpYallXLSEpDRAbBRQfCRUfChMYCAoOCw4SEhQaEhMYDA0UExYfFxsmFBkjDxEYfHRvW0lMIhIcHBomDx0nDBslCxYiBg8cCBIcCg8UDhAWCw0TCQ0UERUfDhIaDxMZLRwnJRskJCIqISwzFSMuDxwoChooBhglBQ0YCRIbBwsRDA4UDA8WDxMcCg0UCQ0SV0I+FRYeAQ0YBA4ZAw8cBRIfAxckDCMxBhckCBAaBgwUBgkOCw4VEBQeDBAXBQcMQiQkOCoqISEpCRUhBhQgAg4aCRgmESAtCRMgExQdCBAZBQ4YBwgOCAsQCQ0SBQgOe25nX0lFNxQYIhAaFxUgDRIdDhEcEQ4YGxccVUlGERUcBxMgBg4VBQYKBQYMBQUKTSEgTSgnOx8hJRAYFg8WJCIlLCMkKR8gMCYlLiQkJyAjERsnCBMdAwkOBAMHBgYLfnh0fHZxc2plRDgyKBsZWlNOS0I9NSgkOi4rJR4eFBIZCg0YBA0ZAw0XAQQJAgQHfnl0e3NuZ1pWbGtpQkBDVExJY1xWWktFUEM8Sz04IhcbDggUCgoVBwoRDBMeISAmd29reXJual5aZ15bREpPMzQ8amBaWEpFalpSbFtUQjEvHxAWFQYNDgoPFxgfTkdH",
+  "Tequila":"JycnJiYmJiYmJiYmJiYmJiYmJiYmJiYnJiYmJiYmOjcwJyYmJiYmJiYmJiYmJycnICAgICAgICAgICAgJiYlPj48SkxJS1FNRVNOLjk4YVhCIiEeICAgICAgICAgICAgHR0dHR0dODg4Z2hodnh1enx6c3p0WmZdUFdLcG5mT0w6JiQgHR0dHR0dHR0dHR0dHB0eVFVWcHR2bHJyc3Zxc3t1X3JmW1lEX2lBZGwfSlURSUkxOTMoGxoaGxsaGxsbPEVKZWtuY2lsaG1vanR0ZHppUVxLd21ZYV8xXWQMOlIRQkUtWVRHOTcuGRkZGhoZQ1NbXGNoaG1wX2hsYHZvUWdXc2tXd2tTamBOZV5IXl1IbF5FW1k9TlYeHBsYGRkZRFRcZ2tvZWxvU2hlXHBpaWpccmVMbWNQZFlIcWVPc2lTcWRLYVY9QVQWGxwaGBgYYGhscHN1XW1sWHRsWVtJeG5ab2JMWFVOXVhTZ1hFaVk/a1tAX081Mj0pJCIdGBgYb3N1bXNyWnFuV15Ya1xIcmVOb2VYcmtmbmpla2BYbF1MZ1g/X082V0s2GBgVGRkZYmtrVW9qS2VcZFtTbl9UbGBSbGNUeXBrenFseXBqbWVcU01FUkQyXVA5IyAcGRkZT2JlSnJoU1REZlhGaFxTeHFsdmxleG9odmtmeG5oenJtcWhhUUU3My0iGhkYGRkZSWplN1ZMT0Y6Y1RBX05CdGxldWxldWxlcmdgbWFacmhib2VeLCklFRUUGBgYGRkZ",
+  "Shamare":"KScoUkxOZE5WZUlSYEpOKicoJiYmKCcnTklKUURKSDdDRDM+OCkzIiIiJiYmJycnXD1JVzlGakpSX0BLUkVHYVlZPjc4bGhoWUdNSzlEUT9JSzdELyUsHh4eICAgICAgXz1MdFpgakxUWT5GOzAzPTg3RDc5WUZKXEhOcmdqZFVZRjU/GhgaHR0dHR0dHR0dYDBFZ0BPWThFVDZAOycwNCMrOyQwRS06Z1JXcmRmbFpdNysvGBgYGxoaGxsbGxsbWStAXzJFbUpVWDZDWDdCQCExRiU2Vi9EUzJDVTZFWj5JUDU+IBsdGRkZGRkZGhoaUSM6WCpAakFRVjRAUCw8VzFBYDZGUyo/Vi1BWS5CbU5Xb09XVzlEUENGMSwtGRkZSyI4XzFFZTpKVjJBSCg3XzhHa0BOZTlKakBOZzxLZD5Ndl5iclNaQSc0QS84LiIqSyM4XzJGUy1BOBwvVzJAXDVFZjxKZDlJaD1Naj9NaT5NaERRclZdTjI/PSk1KxwmQyI2SCU9RSo+OhotYDdGWTJCXDJEVS8/YzhJYzhIZjtLZTpKZTtMVDRCQi04KR4mRC07UjJFVEFPPBsvVi5AWTNBVi5BSCUxUC86XDREYzhJaT9NYDJHSiY8NCQwGxcbMiwwWT9PTjhGQCg3SCM4VS5AZ1NYd2hmZVVUYDtHYjdHXDNGTyVBRiI8LBsrHRYfMiwvMicuMCgvPS04Px4zTSY6bF1efXpzcWRkZUlQTTE6RSE4QR84LxstHxQgFREX",
+  "Bibeak":"JycnJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJycnICAgICAgICAgISEkIyMoICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgHR0dHR0dHx8iOTtWNjhUIiIlRkZGYmJibGxsY2NjTExMKysqHR0dHR0dHR0dHR0dGxsbGxsbJiczNzhXQEJdb29xd3d3fn5+fn5+fX19dXV1amppOjs8LCw0IiImGxsbGhoaIiIiU1NcNjdHbW1vfX19QkFBQUFAaGhoe3t7dXVzZ2ZkZGRiSEhZQUBRGRkZGRkZHx8fVFRUOTk5Y2RuU1NXY2NiLCsqWllYdXV1dXV0aWhnZ2dmbGxuUlJVFhYWGRkZSEhISEdHRkZHPT9XOjxRVFNdKyopODc1amppeXl5c3N0XFxiY2NiRURDGBgYGRkZS0xLPT09ZmZmQEBBSUpZXV5lXV1cOTk4XFxaaGhoSEhMTU1aOzk3Ozk1LS0sGRkZGBkYQkJBYmBeVVRSXl1fVlZbPDs6Pjw7VlVTQ0NDSUlIX19da2poRUNAY2JgGRkZHx8eW1pZV1NOZGBcY2BdZWJgYF1baWhmZmVjYF9dX19daWhmampoWllXY2JfHR0dGxsbOzw7TElGaWNac2xjUkxHV1NPXVpXamhmWVdVYmFfXVxaY2NgX15bX15cPDw8PT08MjIyZGJgd3BnenBlcmlgQT84XFRNZ2VjW1lWXlxZYmFfYWBdXlxaWFdV",
+  "Vigil":"d3h/fX1/dXl7X2JkLC0zKiksTlRVfH1/amVmQUBBKywsZGZnfn9/e3t7eXh5fX19eHp/eHp/fX9/amtuLzI4KikuaWNneHN1XUpOal1hcGtseXN1dGxvT0hLJCQodHN1cnN/dXV4e3h7V1ZaNDc8LS4yLCIpS0BFQSEoX0NLSTU+T0FKMzA4ICEmMDE2e3t8dHB2aWNqdG90PzQ9Ky81Oz1CFBYaFRUaHxcfGx0kJSAlJiQrGx0jNTc8MjA2cXBzbWlubWdwYU1XKyQtOjpAHx8lGhwjFx0lGBgdHyUuJScvNSQrKykwNzU+PjxEZWNpa2dvZFRfVDpHJxslGxUZGRUbJycwICozFxgeNzdEZ11lbk5dRztJLSoyOThAYl5mVFJcRzZCIyMpFBMZFREXHRceMzdEQENPQTpEOS07alttTkRRJR8nNyYvPy4zSUNKLioyHyUpEBAVEhQbExUbISUuLj1KMTlEOTpDIyUuMC46LzQ+GhsfHx8nKR8qWlFbHhwjMDk9EBIYGx8mFxwkMDU/KDA6HCIqMjZBIiUqGRofFxgcJygvGxslGRslKCk0GRcdGRYZEhEWFBYbFRkfMThDGBogFxwiGx4kMTI2Hh8iFBUYFxgcHSErKik3Mi00JiUuIhkfDgoRDw0RGhYYFBQZFRIWFBUZFhYbHR8jIyEbHR4fGBkdIScyJyYzJSUxODpDEhEXDwsTEg4TDQwSEA0SFxUYODI0SEBEJSMmTkxIJygqExMXGhsmICIvKiw2",
+  "Exusiai":"JiYmJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJiYmICAgHx8fHx8fHx8fHx8fHx8fHx8fIiAgKyIiISAfHx8fHx8fHx8fHx8fHx8fICAgHR0dHBwcHBwcHxwcMx8gPyMjRi8tVTk4Wz48UTQyLSIiLSIiIR0dHBwcHR0dHR0dHBwcGxoaHxsbMCIhYUNDcExKbktKakRDZDk6ZTo5UygoLyUlOycoHxsbGhoaGxsbPDo5HR0dHxoaY1BOcFJRb01LakBAaj07Yy8xWSImVB4iPxwcMSMjQycrGxkZGRkZTkpJRkNCV0VEcVRTZjo8azw/ZCwxZi40ZioxVhkgVBkgRhUaIhcVRiAiLR0fICAgMS8uWkZEclJNZi8xVx4hYxYeWhAZUxIcWhYjVBEeTREbQxAZGRAPNRgaRSYsRkJEXVhXaU9Objc2YxwgYT86YBYdYxchVhceWxMiVRMhTw8aPQkXKhQYLRccRSkxUUxPbWVjZVVTYyAlYx8ec2FYZC4xaiQpXyEiYi8uWBghUg8ZRBAbOSssNyIoPyUuTEhMYFpYZ1FTYBwgVRobaE5GcllQbDw5YCEhVCslTBQUVBAXQxwgPjMvJyEfNiEpOjk7JSIhTDo7XysqVRcXZ0c8b1RJeGxjc1pRc1VIZTgxWBQbMRobMygjNx4bLhkfFhUWKCAbQzIiQyYkVBgXblNIdWlfdmtidWtidmphaEpFURIbJxMWKiAcOCchNxgdJRwh",
+  "Lemuen":"f2Rnfmdpf29weWJjdF5fcV5eeFdaeltedVpccllZc1xdRkBAJCUlLi8wVUhKel1ef19hfWBie2Zpb1pcb1ZXcFxZalFQbU9RZlBRblFSb1tbTEhIHx8fLS4wS0BBcltcdlZYclJUbU9RblRUblVXXk5Ob1xXb1hVY09PX05PWk5OU0ZHIyIjGhobMCsrcVpbdFZYbE9RZEpLWUpLY1BRYU5QYE9PcFlWemNgfGFgZ1FRODAwKioqGBgYHxwcZ1FTcVJWZkpTaE1PZ1BSZE9RcFJUblNTalVUdmBaf25qe2FfWkZHFBQVLi4uMSkqak9SaU5VZ01RbFRXVklKWElKYU1NZ1VUc2BeclxZfWJcZlVSQDIyHR0eHBwcLicndVdaZkpQY0tOdFdbZ05PYElKc2VjfHBtfHBse25rbVxYMCYjak9NIiAfHR0dNDAudWNiXUtObFNWf2VqeVtdcWFffnVxf3Zyf3l1fXdzdmlmbFNRdldVS0JBQDw5eXRuf3t0b1RYf2prfWdoalFQdm1qdWtofXdzf314fXl2dG1qcWlmc2Beb1tXTURASEVCT0lHbVVXeGJibllZZ0tLcmZjbWRgeHJvf3x3enZyYVNSXktKYlNRZk1KLykpGxwdGhobaE5RfGNlbVVUXUJCXE5MWUtKc2Ngfnd0f3x4fnh0fHRxemhnbl5dR0A/GRsdGRscRjs9XUpMZkxMUj08bF5deW9se3h0fHl1fH14fHx4fHNxcl9dSkdGSEdHGx0eGxwd",
+  "Rosmontis":"JiYmJiYmJSQlJSAlJyAnJCAlJyYqUE5TYlhiT0VPOzU7PzpAW1ZiTUlTX15iXF5jICAgHx8fHx8fHBodHxshHhwiGRkeHh4kLis0WE5abmNvaV1odG92WVFYaWhvW15sHR0dHR0dHRwcHh0fHRwgHx4hKCcqJCInJSEpRDtJal9tal5rVUNSUUhTUlVgXWVvGxsbGxobGhoaJCEjJiIjJSMkLS0wNTI3VE1UU0VPOjpAMDA4QkBMR0lTPkVUS1BfGhkaGhoaIR8fKiQmJyMmJiElKCcrKyotXltfeXN5fHl8dnR3Y2JpXWFqWV5pY2hwPT5CLi0xLykqJSEiKykrLiwuWEpEXFpbZWRmSURNTURXSkRXSUpaMTQ/UFRdTlFZJSw6Ly0wKSUnKiktLCwuU1BNZFtSbWVdamRjcW1wWVdeT05ZRUdXMjlJLDZEQ01dHyg0MzI1ICEkLC0xT1FUa2VgcmliWFVSSEpGTEdGT0pTSkNUUE9bMDhKOEBSO0FOJC06KywyGhsgMTI1WlhYbWFfenRrX1xYSV9AYmZbdG9tY1ljXFlkMTVGOjxKNjdGHyAsIyQqHRwfV1BKZVxTc2ddfnpxfHdvc3NpdHFmeHVwRj9JTlBgKyw0KywvDAwPFhcXHh4gISEmIyIkamJaWlhScXFpfnpxfXlufXlucG1oT0dFKy0yMTEzDAwODg8WGRkZHh4gJCUpFBcdIyIjU1RSUFhIeHBkenZrenZrdnFnQDo2Hh8iDxATCgkMGBUc",
+  "Waai Fu":"JiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJyYkbE4nelUvSERDJiYmJiYmJiYmJiYmICAgISEhICAgHx8fHx8fHx8fKiUeQzIbWT8bfFkjfWVLcmBJIR8eHx8fICAgICAgHR0dHR0dMSghPC0dSjEWZk4nelUeeE8Ue1IUd0kRel07fGE1MCcYHBwcHR0dHR0dGxsbGhoaNCQpbkcgd0USajwacjsNfFUUflMRdUUTeUwTe2FAQDAcGhoaGhoaGxsbGhoaGRkZSTZGRycoXjIoZDgke1ESfFAPeEgZfWpQfnBjdFUkTTEUKiQjGRkZGRkZHRwcHRwcPS86LR4jXj09c1xKfVEPfFIUe2dYfXNqa11UWDUNYkIOMCckGxgVHxwbGRkZFhYXEQ4TMicpVzEvZEo5fFEQe08PclZCVj8xOCIaNyAVdE0XaFpSdGlheGpiGRkZFQ8VNCYxGwsOOhEKNBcNcEcTSCcMPBwNJhANUSoOHwwIQSAPWToqZUdCXDYwGRkZLxYaVCQkOxgZGwsKEAkKLhcRNhkRLw4GSxkSb0YiNRgJNRYLGwgGWjEyXDUxGRkYGRERHw8STC43MhoUCgUGHw8PKhQRYz4vXiISWEA8QC0mYSoIOx0MVzAyXzo3GRkZGBcYLyQtRio2bD4fKxsVEQsQNSAdXkxIZz8yWSsqZElHbz4SVTosLBwbIBkZGRkZJR8kTjxGWkFMYDo4NyQjMxsZNhsMaz8HY0sqSDUzYD81YUY4XzwmPC8kGBgY",
+  "Specter":"JycnJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJycmICAgICAgICAgICAgICAgICAgICAgICAgICAgHyAgICAgICAfICAgJSUlZF5cX1VRHR0dHR0dHR0dHR0dHR0cIyMjLCsrNjQxSEVCTElIRURDPj49JycmLSsqYlVSY1RQGxsbGxsbGxsbGxsaLy4tR0ZHREBBQz9ASkhIT0tLT0xMW1lZQ0JCKykoYlRQY1NPGhoaGRkZGRkZMDAwQD4/Q0FCRkNFQz9ASUZHS0lKTEpLS0lLUE5RR0RFZFVRY1JOGRkZGxsbMDAwPTs7PTs9QT4+RDMxOx0WNTQ1NTQ1GhkaOjg6NDI0Qj4/ZVVQZVROGRkZPT0+MzIzODY4PDo9PycgZSsaVygbSERDLSsrGBcYJyYnLSosNTAwaVhRaFdQJygpGhoaNTQ1MyclNispPjAsXDUmY1RPVkpISUFBQj5ARkRGJSIlLykqcGBaaFZPNDExHR0cLyEcTx8USTQuV1VWbm1taWNjdGNgY1RRYFpbTUpNLiksMy0ve3JvdGdiVUVATUJBQj9ASTk1TEJDZF9gaGRmaWBfbl9bSDs5X1hYWFZZTERFJiIle3Z1eXJvVkdCUEdFVVVXZWNlXFNTZVxcaWRlbmNiUUlIVDQwbGRkYl9gS0VFMzAzfHZ2eXJwW1FTZGFjXFxeZWRmY1tbVklIVEpJZl9edGtpdGdlcmpoZGBiNzU2Ly4zenRzeHBu",
+  "Gladiia":"GyE4HyAwGSQ+GSU+GiU9GSQ6GSQ3GSMzGiMyGSQwGSUxGiY0GiczGiczGyg1Gyo4GxYfDhMhDRMgDRMgDhUiDhckDxUgDxciEBkmEh0rEiAvEiAvEyEvEyMxEyQ0FCo7EBQhCxEjChEgCxQkDBYnFB8yHCQ3HSc0GCQyEB4zDx4xDx8vECAwECIyESs+FCgyFhIoCBImCRIkFh8xKC4/MTZFMzdDNDhCMzdALzM8Iis8FCIyDiEyDyo+ESEpGRkZIhEsBxImExosJis4LzRAMTVCNTlEOj1HOz9IPEBHODxDODtBLzpDLzk+GRkZGhoaIw8qDxktHSAvLi48NzhBKS04LTE8LjI8OD1ETlFYWVtmYGJoWFldZXB0JCQkGRkZFhk4FR84LCMyLSs2MTI7LC87LTA7NzpDQURKSkxRS05STk9UUFJWUlNWKysrGBgZHiQ8HiY/KB4pJyUqMTE4MzU/OjxERkNIRENISklNTEpLPkBFOz1ETE9UPj4/GBgYIilHFholEg0TEhEVHB4kKiwzQ0FGVU5PRjo8OjEzVlFRTkpMNDY9SUtQQEBAGBgYDA4WCQkNDg4TDAsPDg8TDQ0RFBQXKCUmU0VFPzMzV1JPaGNiOD1DT1FVNTU1GRkZCwwQCwwQDQ0SDAwQCAgMCgoODAsPDg4SEhEUSkRDSkRCQkNFWV5iUVFRJCQkGRkZCwwQCQoODQ4SDhAXBAUHAwMECgoNDAwRCQoNFxYYMiQoTlBVZ2doLy0tGBgYGRkZ",
+  "Mizuki":"JycnJiYmJiYmJiYmNjs+Q0tUPUBINjdAODhAOz5DSExSKjE/PEFOMDc9JiYnJycnICAgICAgICAgKC0xJS44HSElGBshGBkgHyEqLDE6Jy06GSApHiUyJTA+LDI5ICAgHR0dHR0dICAgLTQ8ISUmHCAkGBslHB4oHR8oICQvHiYvHyctHiIsHSItLzQ7JikrGxsbGhsbGhobIScuHigwHCIrHScwKzI4Mjc/JSoxHB8iHSEjHyEjGiAmKTNAHSInGhoaGRkZHR8gUk9OTFVdQVFaZWptc3Z4dHZ4ZmpvbW1tW1laNzY3HR4dFxoeFhYWGRkZHSEjQjw3aGRkbXFwYG1uaXR1bHN2dHR5UlZkRlFhamtvdXFxXFtkODU2GRkZGxwdISEiaWJeYGlqV2dsUmdrYXJyZHF0ZW91b2tqYmNmRD9cYDtjb2dtamVpGhocHiEjODc2Sl1iXG5vS1ZgT19mXGxuYXBzWmJkcmlmd3Btak9fZTNeY1tnX2ZsO0FMLzEwOktOUGJnV25vZWFfUFVcX2duXWhwb2tobVxXdWtnamhqSk9kRFBdVmFqWV5kLC0sOlFYU2NpUWxuWENBRDtATlppWFtmb2NiUD9GSzc9X2BmXWBjZ1ZSRl9qYWZqQT5AOElSSl1nS2lqY1hYZUpUVlZgcW9vamxxcmRocF1iV19scmViXV9iQlxuQVtkPzw9Nj9BPlRiS2BiYldUdWhndnFsdnNudnNvdm9rbGBiYFtfUllcRlprRFVtMFJj",
+  "Andreana":"JycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgHR0dHR0dHR0dHR0dHR0dIyMjOjk7REJGS0lNTUpPSUVNNjU5IyMkHR0dHR0dHR0dGxsbGxsbGxsbHh4eODg5REJFSEdLNzQ+NTI+NDA+Rj5MNS86ODU/JCErHRshHBseGhoaGRkZHR0dJiQrLx1BOB5PKiAyHh0eLCk1MC07LSk4NC48NzI+MCw5Ih4sGhchGhoaIB8gIRswKRxKMh1QLhpADg0PEhAVHRsjLys7LCg2KCQzKSEzJyIxIx8uIB0rKiYqaV9pOCVVHRwrHB4sDQwOFhMcLCg3LCc5Kyc4Lys6JiExJyMyIhssKigwJycrRkFFcmpyLyA6EQ0VKCMxKiU0KCI1VExMLSc4Kyg5LCg3JiEwKSU0HxoqJCItKCgsFRQVExEUHRggKyU2LSc5LCU3LSUwUElFVU1NMS02JSIyIhwsJyMxHRknGhYkLiwyMSs2SUNPPDFHLig5KB8xNSw2TEVDQUFRcmpjaWNePztBHhopHxspFhIgIx8sHBslHBsdRTxNKiQ1MCkyVk5NeXBmeG5ld21jeW9mfHhxPjo+HBonGxclEg0cJyQwJSItLSovJyIyIh4uOzU7UElDdmxjd2xieG5keG9leXNsNTI5GxcmFxMhFxMiIB0mODg8",
+  "Skadi":"JycnJycnSz86LCYoLykrNzAxQDY3PzY2PzU2QTc4RDo6Rz09Sj8/Sj8/Sj8/Sj8/ICAgIB8fTTs3JB4gLCUnRDc4STk6Rzc4TD08Sz08Sz08Sz08Sz08Sz08Sj08ST08HR0eGxoaNispJR4gS0REbWlmfHt4W1FRQzI0SDc3Sjk6Szw8TDw8Szw8Szw7STs7GxsbIBsbIBkcIhocTD8+WlJPenl0fn96U0tLQzEzRzQ2Py0wOSosOSwtNCgqKyIkGhoaQDItOC8uOjIxZ11aXFFNVEhGcW1of394WE5QPy0wSjg5STY4QzEzOysuMiQnGRgYUz03UUlGfX16dnJuWEtILB8fJRoZZ2Jcf354XFFRPSotSjc5Szg5Szg5Szg6IRwbMCUjU0pHaGRhY0pIXUJAQjY0UEZEUURCaF9ZfHZtU0ZEOigsSDQ1TDg5Szg6Jx4cIhsdUklGKiAfTD06bGhneHV0a2FfXlJQWk1MYFJOcmZeSDw6Kh0gPCotSzc5Kx8eHxgaTEJBPTQxdHFudHFwZF5bX1RTaFFQVzY1WUpJXE5La1hRUkA9JxseLB8jRC8rGhQWRjw7Rzw8YVZTXVhWb2pmY0lEYC4tbTMval9bXVNQW0xKZFJMVkRBKBocKh4eGhQWQTc3Szg2U0A8VElLZ1lTdGljcmtlf3pwd3NqZlxYYFZTWk1LXUxIWEtHFQ8RGhUXMSkpTDs3Tjk0Y0xFWj01enRvaWFbbWdgfXdraFxVY1tYZ1xXVklIVEZE",
+  "Haze":"Nzc2WFZVMjEwLSsqPTU0SkZHZFxhY1lbXlxdWVVVXVhYdXB0WFdZPj5ANS0vJyUmLCssUlBOOTg3JiMiLyspNjU1MDAwPDs7TU1MXltcZ2ZnZWFkYV9hLCsqLCYnJyUlISEhWFVUUU5MLysqODEuNS0qOTEvRD47QDw5RUE+UU5NaWVpYV9iQUBBKCYlMS0sISAgTkpJVVFQQTs5PTQyT0pIXVZWXFhYS0dGPzk3Qzw4QDo3Pz5AS0lMOTk5MiwtNC0uUEhISkFASD89UU9PXlVWVkdHRz87QDk1QTo0RDw1RDw0NC4sNTQ0PDw8Ozk6NigoU05PTUVCS0lHVktKSDs2U0hBWE5HW1FJW1BHU0c9ST84Rz05NTQ1NjY3MS8wIhsbVkVFUUxIQj07Wk9Ia2BUamBVcmhgZFpRZlxUY1hNU0c9QTkzPz08ODk6MC4vGRkZUTs4SzYySUE+cWVibGFac2licWhfaWBXaWBXbGFbX1NLRjs1QDs4QEBAKhoZHRwbSjo4PyUiTEM9ZlxUaF9WbWNbYVhPY1lQX1ZNZVxTVEpBRjw0Rz44OTMxJB4cLSonSD88NyIeTkM7XFJJXVNKYlhQW1FJY1pRWE5FWE9GSkE4Rj01PzYvMSclNS4qSkNCUklFXFJKV01ENi0mPi8nWE9IcWpkZFtUOSwmNCUdLycjRDszNSsmOC4qTkY+aF1gXVNQa2FaY1pRU0lCXExAcGZgeHNveG5paFlPVUlATEE7PzQsQTcxPzYvSkE6",
+  "FEater":"JiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJSUlJSUlJiYmJiYmJSUlJiYmICAgHx8fHx8fHx8fHx8fHx8gHx8fICAgIiIiLSwrLi0sHBwcFBQUHx8fHx8fICAgHR0dJCQkFxcXDw8PGBgYMTEwXVpaW1tbYGJkVlVWFRYXGxwcHBwcEhISHh8eJCQkGxsbKCcnDw8PDAsLICAhXl5eUlVYYGFjYWJkWlxdGxweEBEUERMUHh8gREdKTlJWIyMjOzo5CgoLJygpY2RmXmBjX2BjXmBjUlRXWVxfTVBSMjM1JigrMjY8UVRYVVhbPT09VFRUTVBTX2FiUVNVTlBSaWpsZmdpT1FTLTA1QkRHT1NWRUlNIyYpJSUmYWJjSUpLOTs+OT1CPD9DMTQ4ZWltaGptYWNnZWpvSk5THyImKCgqYGFiR0tPOTw+ERIRTE5QP0NGMzk/MTc7VFVXZWdpamxwZmpwZmtwZ21zP0FFERIUHh0fSEpNR0tQKCosREhNLTE1MDY7Rk1UbG1vaGlqa2tuZWZpX1tcZWZnb3ByJiYnCwoMIiQnTlFWODs+Q0ZKNTg7FxcXVFZZcHFzdHZ3eHp8dHV2YlVWYFdYa2xtXFxdEQ8RGhsdSExRNzk8XWBjLC8zHR0dXFxeZ2hqbm5wc3V2b25vZFxdYVpbVEpKZ2dnIB4fOjk6TlBSHh8fQERKHyEjKysrXF1gW1xfZGVnaGlraGVlYlZVWUtKYVBQYWFiWlpaVVVWPD0+Q0ZI",
+  "Underflow":"JyQuJSIsLC8/Ympyenh1XlRRMTVKMzpROUJeQkJcP0ljOztOOEFWNjdMOTtPMTBDMTZIKy9BJB8lMz5ObnR4dXFuU0xTPkRcOEBaPUdhNjlcPkBSLDJIPkNYPEJYOjpPMjtTMThPLzJAHRokLzM5MzQ7OzdGR0paQkhaSk1aQkVdQERTLDA/MDdCMj9SS01qN0RWMjZEJic0JSIrJic0NDlOPUlgTFJnYl9vYGBuYF5uRkhVPkJPNDhONj5ROj5dOD5MMDhDNjA0OzhDPUFNV1hmVlprXl9vbGt0cHF7cnF8bWpwTE9dRUZUMzVNQEJXMjxUQExZMjRAOj9FRk5aW11pcG94c3J7eHl+fHt+d3Z8b211Wl1mP0NRLS5DKCtDHRwnKS48RE1YPUNNWFpjZmVsdHN4eHh9d3d9eXl9d3d8dXZ6W11lQEZVQkhUMDZIIyQrICQvNDY9SlBYTFFZV1ZcZmRqcHB3b3B3aGt0c3V7aGtyR1FbMDlMQkhPZmZgHhwgJyQtPD9JQkVNR0VLYl5hT1JbTFNfTFRiXmFsXWFsTlZhSlJbKS5CLS84UFJVGA8WFRAZNThBR0NFV1NWfXx8Y2ZqREZPNjlJU1ReUVdiPUNSQUtVLzBCNThEZmxzFBIWExAVKyoxTkhJTkFKcmxscGtrUkdKSD9FSkhOS1FZS0xRUkpPQjpAQ0hWanN5FxcXHR0eGxsePjc2enNxend3fHl4cGdoRjtARERITExRS0hPJyAqPztHTFRkaXBz",
+  "Kafka":"JycnJiYmJiYmJicnKyopTEhAXFtTSD47NywqMywrODY1ODY1JiYlJCQkJiYmJycnICAgICAgICAgISAfTklDNTg2JSsuHiIkIycoJCssLC4tLS0sJyglHh4eICAgICAgHR0dHR0dHx8eSUM+LjEzJiwwIigtHyEmISMmJScmKzEvMjEuKCwpHiAgHR0dHR0dGxsbICAfPkA7Ki4wHR4iHh0iKy4wKiIhMCchNSskNi4mKycjJzMyHicoFxgYGxsbIyMhNzYwIysrHh4jKyMhT0pBXGNYXlVHWlBBW1RDVUo4TT8xMSgiHicoFxobGRkZPj41KTEuNTc2SD47UUAxSz8wVldIOi8kRTsvSUA0XlVIXFBCTUE2JyYmGyMkFhYWNzs2Uk9HSEQ8RDcwPC0jNCskUU5DOy4lQTQrLyUePjIpOi8mPDEpNSwmHyYnFxgXOj47Qzs1KSMgPjMtJh8bOjEtYFpRRTsya2FYLCUgKSMdOi4nKyIbMScgIiMkKSsmICEfMCwoJCAoJR4dIRoXRjkyR0lETUA5Ni8rIx4bKiMeTEI7LychJx4ZHRwcOUA5NkpFPFJLVmBcZGtnZ25oVFFNTlNNWEhCampiaWhbQEpDVFVPMC4rHxkXFRQSM0A7JCQtQTg1OC4sMikjKyMfcGZddnBofnVtfnZtfHVrSTswRD03LyUfIh8cFRIRLT44OjQxVUU3PzIoKCEcNCkjc21kc3NreXBnfXl0fHJpal9PYVlPLyIdFhQaFBMSKS8q",
+  "Siege":"JiYmJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlLSsoOzIoMy4oJSUlJSUlJSUlJiYmICAgHx8fHx8fHx8fICAfKiciPzYqRDkqMCkiOC8kPDEkQTYoHx4eHx8fHx8fICAgHR0dHBwcHBwcLSkiTj8sRTUlLiIaLyUeMicfNywhST0qTUAsKSQeIB8eHR0dHR0dGxsbGhoaLigiWEUvLhsUJBkVJBoVMSEYMSQZPTIiWEoxXlE1OTEiHx0aGhoaGxsbGRkZGhoZV0g0OSEYIRUQIBcUIhgTKR0YST0rW0sxW0wvWksuVEYuMi0oGRkZGRkZGRkZIyEdVkIvLhoTIhgUIBYTHRQRMigeYFQ8YFM5XU4zXE0wXU4wal9JMS8uGhoaNTEjYFlCSTMjKhoUHxURIhcSOy4gX1Q+ZFlDYVU9XlI4XE0zW0sxXEsvZVtIMTAtaloycmdHQisfJhgTJhkRQTAfYVY+Zl1IW1A7Wkw1WUszXU83WksxXEswWkktZlc9PTQhal09OSQaKhkRQzIeXlI5ZFtFX1RAWEs2Wko0PzMkT0EuWk00WUkwWUgsblw5Ih8bSD4tPiocRDIdXE8yX1Q7YVdBXlM9UkMvSDkpNTYzSjYnVkcxXE01WEkzW0suPz43TUY9VEMsYFMzY1g7V0cuV0kzUUQvUUEsWUcyYUs2XkUwTz4qXVA6YFM9WkowKiYjKCQeYVlCZFc4XE80V0YwRjUjPjUoVUUxWkkzYk02X0k0U0EvVkgzVEYzY1M6",
+  "Morgan":"PjoyUkg0PjcnQjclZFhAb2RLXlA3RzslQzklMCwlOjUpNC8lJiUjJSUlJSUlJiYmTj4kQzYhOzEgaVxCaV9GXEwxUkMoTD4lV0wyRTsoLCcaPDUiIyIgHx8fHx8fICAgQDUfQzcjYlAwV0crVkkxW04zVEUqSD4kOCoWIh4RFRMNOTIfNDEqHRwcHR0dHR0dVkQkXUopRzYaTkIqXlQ5XVE1SjwiQjATQTIYPTgjQTwoU0swQDYkMy4jHxwWGxsbTkAkTT4hVEUoVkkuXFM5VkkrSDkcT0AkbmdHa2dKcW5Qa2VGQDMYOzIjNzMpMSwhPzEXRDQYXlI5V002S0AoVUUnSTkea19CeHVVZF0/cGlJal49QTMYOiwUMSgYIRsQRjceWEksYVg/SDogUkMmQDEYU0cvaF9AZVk5ZVs7cGdFVEgtOy8WOy0UNCkUFBMSUEIpXk8tQjgjVUUnMCMQMigVWEswYFM0U0YpXVAzWkszQjUhOCwVOi0VPC8XGBcWNScRY1UzTkAlLSEQLiEPRDYhVEUpT0EmSD0lRzwpVko9Sz0rQzQZMicROy4WGBYTSDgeT0AiNicOKx4OQTUdSz8lWkstQTYeRjslMicYQDgxRjgnQDEYNyoTPjAWGhgVNycQQzUZMyYRMCMQMCQTQTUfVEktPzUeVks7aGBVXVNNQTMhNysbOSwUNysUKSQaLyANPC8XJh0KIBgJMicYST0mPjMdRzwjW1NJcGhibWRePjQrLiUUOy0ULSYXHxsV",
+  "Ebenholz":"JiYmJiUkKiYkJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlIyMjIiEhLiUjMC4sJSUlICAgHx4dJR0aJCMjHx8fIyIhHh4eHx8fIR8fIyEgHx8fISAgLyAYIxMOKCYmHx8fHR0dHBwbKxwUHhsaJCQkKignNTEwWE9LS0RBR0E/JCMiKCAeSS0aIBcTGxsbHR0dGxsbGhkYJRkRIx4dLiwrS0lISEVDSENAWFNQXllWLSQhLiMgNiUdFhUVGRkZGxsbGhoaGRkZIBkWNzIwUE1KUlFQQkA/TUhEOzc1NzQyHxoXHxQTPTg2GxoaGRkZGRkZGRkZGBgYGxoZJiMiIyEgNTAvLCkoKCUlIh8fFxYWFhQUEw0LTkdELScmGRgYGRkZGRkZGBgYGBgYHBobHRsaLyknNzIxQzo4OTMxLSgnJSEgIh4dODQxVU5KGxoZGBgYGRkZGBgYFRQUGRcXHxwbKCMiKCQjLSgmMiwrPjY0LyooJSAfLysqVE5KMy0pFxcXGRkZGRkZExMTEhESFRQUFxYWHRsaHBoZMSwrGBYWFBITFhQUJiMiTkpGHBoZGBgYGxsbHh4eHh0dDw4PGxgYGRYWFxUVHRoaWlRRIyAfDw4ODg0MRDw3JiUjFxcWGRkZGRkZFxcXIiIiExMTHxsbLyooEhERKyYlODEwQjw6Dg4ODg0NPzo2Z2VjLy8uGhkZGRkZHBwcQEBAFBQUIR4dSkNDKCQkWlJOY1xZSEBDCwoKERAQExISExIRHhwbHx0b"
+};
+/* ô nhân vật trong hàng (đơn vị tham chiếu): x tính từ REF.x0, y tính từ mép trên hàng */
+const SLOT = {x:320, pitch:180, w:158, dy:27, h:165, count:5};
+const GW = 16, GH = 12;
+
+function markTarget(t){
+  const d = new Date(t), m = d.getHours()*60 + d.getMinutes();
+  for(const [h,name] of Object.entries(MARK_BY_HOUR)){
+    let diff = Math.abs(m - h*60); diff = Math.min(diff, 1440-diff);
+    if(diff <= 60) return name;
+  }
+  return null;
+}
+function pixelsOf(bitmap){
+  const c = document.createElement("canvas"); c.width = bitmap.width; c.height = bitmap.height;
+  const x = c.getContext("2d",{willReadFrequently:true}); x.drawImage(bitmap,0,0);
+  return {data:x.getImageData(0,0,c.width,c.height).data, w:c.width, h:c.height, k:c.width/REF.w};
+}
+/* game cuộn lệch vài px mỗi lần chụp: dò mép trên thật của hàng (nền sáng -> nền tối) quanh vị trí chuẩn ±30 */
+function findTop(px,T){
+  const {data,w,h,k} = px, x0 = Math.floor(1477*k), x1 = Math.floor(1517*k);
+  const L = y => { let s=0; for(let x=x0;x<x1;x++){ const i=(y*w+x)*4; s+=data[i]+data[i+1]+data[i+2]; } return s/3/(x1-x0); };
+  const lo = Math.max(1,Math.floor((T-30)*k)), hi = Math.min(h-1,Math.ceil((T+30)*k));
+  let best = null, prev = L(lo-1);
+  for(let y=lo;y<=hi;y++){
+    const cur = L(y);
+    if(prev>=70 && cur<70 && (best===null || Math.abs(y/k-T) < Math.abs(best/k-T))) best = y;
+    prev = cur;
+  }
+  return best===null ? T : best/k;
+}
+function slotSig(px,top,j){
+  const {data,w,k} = px;
+  const rx0 = (REF.x0+SLOT.x+j*SLOT.pitch+10)*k, rx1 = rx0+138*k, ry0 = (top+30)*k, ry1 = ry0+105*k;
+  const out = new Float32Array(GW*GH*3); let n = 0;
+  for(let gy=0;gy<GH;gy++){
+    const y0 = Math.floor(ry0+(ry1-ry0)*gy/GH), y1 = Math.floor(ry0+(ry1-ry0)*(gy+1)/GH);
+    for(let gx=0;gx<GW;gx++){
+      const x0 = Math.floor(rx0+(rx1-rx0)*gx/GW), x1 = Math.floor(rx0+(rx1-rx0)*(gx+1)/GW);
+      let r=0,g=0,b=0,c=0;
+      for(let y=y0;y<y1;y++) for(let x=x0;x<x1;x++){ const i=(y*w+x)*4; r+=data[i]; g+=data[i+1]; b+=data[i+2]; c++; }
+      out[n++]=r/c; out[n++]=g/c; out[n++]=b/c;
+    }
+  }
+  return out;
+}
+/* chuẩn hóa từng kênh màu (trừ trung bình, chia độ lệch chuẩn): chịu được ô Distracted phủ đỏ, ô sáng khi không làm việc */
+function normSig(a){
+  const n = a.length/3, out = new Float32Array(a.length);
+  for(let c=0;c<3;c++){
+    let m=0; for(let i=c;i<a.length;i+=3) m+=a[i]; m/=n;
+    let v=0; for(let i=c;i<a.length;i+=3) v+=(a[i]-m)**2;
+    const sd = Math.sqrt(v/n)+1e-6;
+    for(let i=c;i<a.length;i+=3) out[i]=(a[i]-m)/sd;
+  }
+  return out;
+}
+const opsNorm = {};
+function identify(sig){
+  const s = normSig(sig); let best = null;
+  for(const name in OPS){
+    const t = opsNorm[name] ||= normSig(Uint8Array.from(atob(OPS[name]),ch=>ch.charCodeAt(0)));
+    let d=0; for(let i=0;i<t.length;i++) d+=Math.abs(s[i]-t[i]); d/=t.length;
+    if(!best || d<best.d) best = {name,d};
+  }
+  return best.d <= MATCH_MAX ? best : {name:null,d:best.d};
+}
+/* đếm điểm ảnh đỏ thuần (dấu ⚠, chữ Stopped, mặt cười Distracted) trong vùng tham chiếu, quy về đơn vị ảnh 2576 */
+function redCount(px,x0,y0,x1,y1){
+  const {data,w,h,k} = px; let n = 0;
+  const ya = Math.max(0,Math.floor(y0*k)), yb = Math.min(h,Math.ceil(y1*k));
+  for(let y=ya;y<yb;y++) for(let x=Math.floor(x0*k);x<Math.ceil(x1*k);x++){
+    const i=(y*w+x)*4; if(data[i]>170 && data[i+1]<100 && data[i+2]<100) n++;
+  }
+  return n/(k*k);
+}
+const roomWarn   = (px,top) => redCount(px, REF.x0+250, top-10, REF.x0+320, top+70) > 60;   // ⚠ cạnh tên phòng
+const stoppedOn  = px => redCount(px, 1990, 1030, 2210, 1130) > 150;                       // chữ "Stopped: N"
+const distracted = (px,top,j) => { const sx = REF.x0+SLOT.x+j*SLOT.pitch;                  // mặt cười đỏ
+  return redCount(px, sx-12, top+168, sx+40, top+206) > 15; };
+function checkRoom(team,room,slots){
+  const need = COMBO[team][room].map(g=>[].concat(g)), extra = [];
+  for(const s of slots){
+    const k = s.name ? need.findIndex(g=>g.includes(s.name)) : -1;
+    if(k>=0) need.splice(k,1); else extra.push(s);
+  }
+  return {missing:need.map(g=>g.join("/")), extra};
+}
+/* morale = độ dài phần trắng của thanh dưới chân dung (dy 186-191, rộng bằng ô 158).
+   40px đầu bị mặt cười che, nên phần trắng không lộ ra thì coi là <= 25%. Trả null nếu ô không có thanh. */
+function moraleOf(px,top,j){
+  const {data,w,k} = px, sx = REF.x0+SLOT.x+j*SLOT.pitch;
+  const y0 = Math.floor((top+186)*k), y1 = Math.ceil((top+191)*k);
+  const xa = Math.floor((sx+40)*k), xb = Math.ceil((sx+SLOT.w)*k);
+  let maxL = 0, lastWhite = -1;
+  for(let x=xa;x<xb;x++){
+    let s=0; for(let y=y0;y<y1;y++){ const i=(y*w+x)*4; s+=data[i]+data[i+1]+data[i+2]; }
+    const L = s/3/(y1-y0);
+    if(L>maxL) maxL = L;
+    if(L>200) lastWhite = x;
+  }
+  if(maxL < 100) return null;   // phần xám (morale đã mất) sáng ~110-200, ô trống tối hơn nhiều
+  const end = lastWhite<0 ? 40 : (lastWhite+1)/k - sx;
+  return Math.max(0,Math.min(1,end/SLOT.w));
+}
+
+function rowCanvas(bitmap, top, fixRotate){
+  const k = bitmap.width/REF.w;
+  const y0 = top+4;
+  const c = document.createElement("canvas");
+  c.width = Math.round((REF.x1-REF.x0)*k);
+  c.height = Math.round(REF.h*k);
+  const x = c.getContext("2d");
+  x.imageSmoothingQuality = "high";
+  x.drawImage(bitmap,REF.x0*k,y0*k,(REF.x1-REF.x0)*k,REF.h*k,0,0,c.width,c.height);
+  if(fixRotate){   // che nút Rotate bằng ô trống của hàng phía trên
+    const px0=2200, px1=2428, py0=top+105, py1=y0+REF.h;   // chuẩn: top 925 -> py0 1030
+    x.drawImage(bitmap,px0*k,(py0-256)*k,(px1-px0)*k,(py1-py0)*k,
+                (px0-REF.x0)*k,(py0-y0)*k,(px1-px0)*k,(py1-py0)*k);
+  }
+  return c;
+}
+
+async function compose(list){
+  const cv = $("out");
+  const g = cv.getContext("2d");
+  const shot = captureTime(list.find(Boolean));   // giờ chụp ảnh đầu tiên có mặt (thường là CC), không phải giờ chạy tool
+  const missingKeys = ORDER.filter((k,i) => !list[i]);
+  const FULL_NAME = {cc:"Control Center", fac:"Factory", trade:"Trading Post"};
+  const MISS_H = 150;
+  const now = new Date(shot);
+  const target = markTarget(shot);
+  let mark = null;
+  const roomSlots = [];                // người trong từng phòng (để so combo)
+  const warns = [];                    // cảnh báo trạng thái: ⚠ phòng, Stopped, Distracted
+  const badRows = [];                  // hàng có ⚠: viền đỏ
+  const badSlots = [];                 // ô Distracted
+  let stopped = false;
+  const pad = n => String(n).padStart(2,"0");
+  const time = pad(now.getHours()) + ":" + pad(now.getMinutes());
+
+  const M=48, RW=56, RG=14, GAP=8, SG=22, HD=186, BOTTOM=20;
+  const W = OUT_WIDTH;
+  const TW = W - M*2 - RW - RG;
+  const TH = Math.round(TW*REF.h/(REF.x1-REF.x0));
+
+  const sections = [];
+  for(const [i,key] of ORDER.entries()){
+    if(!list[i]){ sections.push({key,rows:[],missing:true,height:MISS_H}); continue; }
+    const bitmap = await createImageBitmap(list[i]);
+    try {
+      const px = pixelsOf(bitmap);
+      const tops = ROW_TOPS[key].map(T => findTop(px,T));
+      const rows = tops.map((top,j) => rowCanvas(bitmap,top,key==="fac" && j===3));
+      if(key !== "cc"){
+        if(stoppedOn(px)) stopped = true;
+        tops.forEach((top,r) => {
+          const room = ROOM_IDS[key][r], slots = [];
+          if(roomWarn(px,top)){ warns.push(ROOM_NAME[room] + ": có dấu ⚠ (phòng có vấn đề)"); badRows.push({i,r}); }
+          const n = room==="F4" ? 3 : SLOT.count;   // F4: 2 ô cuối bị nút Rotate đè
+          for(let j=0;j<n;j++){
+            const morale = moraleOf(px,top,j);
+            if(morale === null) continue;          // ô trống / ô khóa: không có thanh morale
+            const id = identify(slotSig(px,top,j));
+            slots.push({j,name:id.name,d:id.d});
+            if(distracted(px,top,j)){ warns.push(ROOM_NAME[room] + ": " + (id.name || "?") + " Distracted (hết morale)"); badSlots.push({i,r,j}); }
+            if(target && id.name === target && (!mark || id.d < mark.d)) mark = {d:id.d,i,r,j,morale};
+          }
+          roomSlots.push({i,r,room,slots});
+        });
+      }
+      sections.push({key,rows,height:rows.length*TH+(rows.length-1)*GAP});
+    } finally { bitmap.close && bitmap.close(); }
+  }
+
+  if(stopped) warns.unshift("Có phòng Stopped (dừng hoạt động)");
+  // tự nhận team: team có ít chỗ lệch nhất (hòa thì theo lịch giờ)
+  const errorsOf = t => roomSlots.map(x => ({...x,...checkRoom(t,x.room,x.slots)})).filter(e => e.missing.length || e.extra.length);
+  const cost = es => es.reduce((s,e) => s + e.missing.length + e.extra.length, 0);
+  const e1 = errorsOf(1), e2 = errorsOf(2);
+  const team = cost(e1) < cost(e2) ? 1 : cost(e2) < cost(e1) ? 2 : TEAM_BY_HOUR(now.getHours());
+  const errors = team === 1 ? e1 : e2;
+  const date = pad(now.getDate()) + " / " + pad(now.getMonth()+1) + " / " + now.getFullYear() + "   ·   TEAM " + team;
+  const pct = mark ? Math.round(mark.morale*100) : null;
+  const pctTxt = pct === null ? "" : (pct <= 25 ? "≤25%" : pct + "%");   // dưới 25% bị mặt cười che
+  const alert = pct !== null && mark.morale < MORALE_ALERT;
+  const moraleMsg = alert ? target + " morale " + pctTxt + " (< " + Math.round(MORALE_ALERT*100) + "%)" : "";
+  // mỗi ô sai: "đang là X → phải là Y"; ô trống thiếu người; người dư khi phòng đã đủ
+  const opName = s => s.name || "operator không rõ";
+  const roomMsg = e => {
+    const parts = [], n = Math.min(e.extra.length, e.missing.length);
+    for(let k=0;k<n;k++) parts.push(opName(e.extra[k]) + " → phải là " + e.missing[k]);
+    if(e.missing.length > n) parts.push("ô trống → phải là " + e.missing.slice(n).join(", "));
+    if(e.extra.length > n) parts.push("dư " + e.extra.slice(n).map(opName).join(", "));
+    return ROOM_NAME[e.room] + ": " + parts.join("  ·  ");
+  };
+  const missMsgs = missingKeys.map(k => "Thiếu ảnh " + FULL_NAME[k] + " (chưa chụp, chụp lỗi hoặc quá 5 phút)");
+  lastAlert = [missMsgs.join("; "), moraleMsg, warns.join("; "), errors.length ? "Sai operator so với Team " + team + ": " + errors.map(roomMsg).join("; ") : ""].filter(Boolean).join(" | ");
+
+  // các băng cảnh báo dưới phần giờ
+  const banners = [];
+  if(missMsgs.length) banners.push({color:ALERT_COLOR, ink:"#ffffff", title:"⚠  THIẾU ẢNH", lines:missMsgs});
+  if(alert) banners.push({color:ALERT_COLOR, ink:"#ffffff", title:"⚠  " + target.toUpperCase() + "  MORALE " + pctTxt + "  ( < " + Math.round(MORALE_ALERT*100) + "% )", lines:[]});
+  if(warns.length) banners.push({color:ALERT_COLOR, ink:"#ffffff", title:"⚠  CẢNH BÁO PHÒNG", lines:warns});
+  if(errors.length) banners.push({color:LINEUP_COLOR, ink:"#1d1100", title:"⚠  SAI OPERATOR SO VỚI TEAM " + team, lines:errors.map(roomMsg)});
+  banners.forEach(b => b.h = 64 + b.lines.length*36 + (b.lines.length ? 10 : 0));
+  const AH = banners.reduce((s,b) => s + b.h + 12, 0);
+
+  cv.width = W;
+  cv.height = AH + HD + sections.reduce((s,x)=>s+x.height,0) + SG*(sections.length-1) + BOTTOM;
+  g.fillStyle = "#0d1117";
+  g.fillRect(0,0,cv.width,cv.height);
+  g.imageSmoothingQuality = "high";
+
+  // thanh 3 màu trên cùng
+  const seg = Math.floor(W/3);
+  ORDER.forEach((key,i) => { g.fillStyle = COLORS[key]; g.fillRect(i*seg,0,i<2?seg:W-2*seg,10); });
+
+  // giờ + ngày + team trên một dòng
+  g.textBaseline = "alphabetic"; g.textAlign = "left";
+  g.font = "800 124px " + FONT; g.letterSpacing = "-4px";
+  const w1 = g.measureText(time).width;
+  g.font = "500 34px " + FONT; g.letterSpacing = "4px";
+  const w2 = g.measureText(date).width;
+  let x = (W-(w1+48+w2))/2; const base = 150;
+  g.fillStyle = "#ffffff"; g.font = "800 124px " + FONT; g.letterSpacing = "-4px";
+  g.fillText(time,x,base);
+  g.fillStyle = "#828d9c"; g.font = "500 34px " + FONT; g.letterSpacing = "4px";
+  g.fillText(date,x+w1+48,base);
+  g.letterSpacing = "0px";
+
+  // vẽ băng cảnh báo
+  let by = HD - 8;
+  for(const b of banners){
+    g.fillStyle = b.color;
+    g.beginPath(); g.roundRect(M,by,W-2*M,b.h,14); g.fill();
+    g.fillStyle = b.ink; g.textBaseline = "middle";
+    g.font = "800 32px " + FONT; g.letterSpacing = "1px";
+    g.textAlign = b.lines.length ? "left" : "center";
+    g.fillText(b.title, b.lines.length ? M+24 : W/2, by+33);
+    g.letterSpacing = "0px"; g.textAlign = "left";
+    b.lines.forEach((line,k) => {
+      let fs = 24; g.font = "600 " + fs + "px " + FONT;
+      while(g.measureText(line).width > W-2*M-48 && fs > 14){ fs--; g.font = "600 " + fs + "px " + FONT; }
+      g.fillText(line, M+24, by+64+k*36+12);
+    });
+    g.textBaseline = "alphabetic";
+    by += b.h + 12;
+  }
+
+  // từng nhóm: dải màu dọc + các hàng phòng
+  let y = HD + AH;
+  for(const sec of sections){
+    g.fillStyle = COLORS[sec.key];
+    g.beginPath(); g.roundRect(M,y,RW,sec.height,14); g.fill();
+    g.save();
+    g.translate(M+RW/2,y+sec.height/2); g.rotate(-Math.PI/2);
+    g.fillStyle = RAIL_TEXT[sec.key]; g.font = "800 20px " + FONT; g.letterSpacing = "4px";
+    g.textAlign = "center"; g.textBaseline = "middle";
+    g.fillText(RAIL_NAME[sec.key],2,1);
+    g.restore();
+    g.letterSpacing = "0px"; g.textAlign = "left"; g.textBaseline = "alphabetic";
+    if(sec.missing){   // khung trống báo thiếu ảnh
+      g.save();
+      g.fillStyle = "#1a1f27"; g.beginPath(); g.roundRect(M+RW+RG,y,TW,sec.height,10); g.fill();
+      g.strokeStyle = ALERT_COLOR; g.lineWidth = 3; g.setLineDash([14,10]);
+      g.beginPath(); g.roundRect(M+RW+RG+2,y+2,TW-4,sec.height-4,10); g.stroke();
+      g.setLineDash([]);
+      g.fillStyle = ALERT_COLOR; g.font = "800 40px " + FONT; g.letterSpacing = "2px";
+      g.textAlign = "center"; g.textBaseline = "middle";
+      g.fillText("⚠  THIẾU ẢNH " + FULL_NAME[sec.key].toUpperCase(), M+RW+RG+TW/2, y+sec.height/2);
+      g.restore();
+      g.letterSpacing = "0px"; g.textAlign = "left"; g.textBaseline = "alphabetic";
+    }
+    let yy = y;
+    for(const row of sec.rows){
+      g.save();
+      g.beginPath(); g.roundRect(M+RW+RG,yy,TW,TH,10); g.clip();
+      g.drawImage(row,M+RW+RG,yy,TW,TH);
+      g.restore();
+      yy += TH+GAP;
+    }
+    sec.y = y;
+    y += sec.height+SG;
+  }
+
+  // vòng khoanh 1 ô + nhãn
+  const s = TW/(REF.x1-REF.x0);
+  const ring = (i,r,j,color,label,ink,width) => {
+    const rx = M+RW+RG + (SLOT.x + j*SLOT.pitch - 6)*s;
+    const ry = sections[i].y + r*(TH+GAP) + (SLOT.dy-4-6)*s;
+    const rw = (SLOT.w+12)*s, rh = (SLOT.h+10)*s;
+    g.save();
+    g.strokeStyle = color; g.lineWidth = width;
+    g.shadowColor = color; g.shadowBlur = 14;
+    g.beginPath(); g.roundRect(rx,ry,rw,rh,12); g.stroke();
+    g.shadowBlur = 0;
+    g.font = "800 17px " + FONT; g.letterSpacing = "1px";
+    const lw = g.measureText(label).width + 18;
+    g.fillStyle = color;
+    g.beginPath(); g.roundRect(rx+(rw-lw)/2, ry-13, lw, 26, 13); g.fill();
+    g.fillStyle = ink; g.textAlign = "center"; g.textBaseline = "middle";
+    g.fillText(label, rx+rw/2, ry+1);
+    g.restore();
+    g.letterSpacing = "0px";
+  };
+
+  // ô sai đội hình (người không thuộc combo)
+  for(const e of errors) for(const sl of e.extra)
+    if(!(mark && mark.i===e.i && mark.r===e.r && mark.j===sl.j))
+      ring(e.i,e.r,sl.j,LINEUP_COLOR,"✗ " + (sl.name || "không rõ").toUpperCase(),"#1d1100",6);
+  errors.forEach(e => log("SAI OPERATOR " + roomMsg(e),"er"));
+
+  // hàng có ⚠: viền đỏ cả hàng; ô Distracted: vòng đỏ
+  for(const b of badRows){
+    g.save(); g.strokeStyle = ALERT_COLOR; g.lineWidth = 4; g.shadowColor = ALERT_COLOR; g.shadowBlur = 10;
+    g.beginPath(); g.roundRect(M+RW+RG-2, sections[b.i].y + b.r*(TH+GAP) - 2, TW+4, TH+4, 12); g.stroke(); g.restore();
+  }
+  for(const b of badSlots)
+    if(!(mark && mark.i===b.i && mark.r===b.r && mark.j===b.j))
+      ring(b.i,b.r,b.j,ALERT_COLOR,"⚠ DISTRACTED","#ffffff",7);
+  warns.forEach(w => log("CẢNH BÁO " + w,"er"));
+
+  // khoanh nhân vật của ca
+  if(target){
+    if(mark){
+      ring(mark.i,mark.r,mark.j, alert ? ALERT_COLOR : MARK_COLOR,
+        (alert ? "⚠ " : "") + target.toUpperCase() + " " + pctTxt, alert ? "#ffffff" : "#06210f", alert ? 7 : 5);
+      log("Khoanh " + target + " (độ lệch " + mark.d.toFixed(2) + ", morale " + pctTxt + ")", alert ? "er" : "ok");
+      if(alert) log("CẢNH BÁO: " + moraleMsg,"er");
+    } else {
+      log("Ca này cần khoanh " + target + " nhưng không tìm thấy trong ảnh","er");
+    }
+  }
+  cv.style.display = "block";
+  $("resultBtns").style.display = "flex";
+  // Tasker bắt hậu tố để báo
+  cv.dataset.name = "ghep_" + now.getFullYear() + pad(now.getMonth()+1) + pad(now.getDate()) +
+    "_" + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds()) +
+    (missingKeys.length ? "_THIEUANH" : "") + (alert || warns.length ? "_CANHBAO" : "") + (errors.length ? "_SAIDOIHINH" : "") + ".png";
+}
+
+/* ====== nút kết quả ====== */
+const blobOf = ()=>new Promise(r=>$("out").toBlob(r,"image/png"));
+async function shareData(){
+  const blob = await blobOf();
+  if(!blob) throw new Error("Không xuất được PNG.");
+  return {files:[new File([blob],$("out").dataset.name,{type:"image/png"})]};
+}
+async function share(data){
+  if(!navigator.share || !navigator.canShare?.(data)){
+    status("Trình duyệt này không hỗ trợ chia sẻ ảnh. Hãy bấm Lưu ảnh.");
+    return false;
+  }
+  try{
+    await navigator.share(data);
+    return true;
+  }catch(e){
+    if(e.name !== "AbortError" && e.name !== "NotAllowedError") status("Không mở được chia sẻ: " + e.message);
+    return false;
+  }
+}
+async function download(){
+  const blob = await blobOf();
+  if(!blob) throw new Error("Không xuất được PNG");
+  const a = document.createElement("a");
+  const url = URL.createObjectURL(blob);
+  a.href = url;
+  a.download = $("out").dataset.name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url),30000);
+}
+$("btnSave").onclick = () => download().catch(e => status(e.message));
+$("btnShare").onclick = async ()=>{
+  try{ await share(await shareData()); }
+  catch(e){ status(e.message); }
+};
+$("btnCopy").onclick = async ()=>{
+  try{ await navigator.clipboard.write([new ClipboardItem({"image/png":await blobOf()})]); status("Đã copy ảnh."); }
+  catch(e){ status("Không copy được, dùng nút Lưu ảnh."); }
+};
+$("btnRe").onclick = () => { lastScan = ""; lastResult = ""; start(); };
+
+$("btnDeleteOriginals").onclick = async () => {
+  if(busy || !deleteOriginalsEnabled || !dirHandle || !resultFiles.length) return;
+  const directory = dirHandle;
+  const originals = resultFiles;
+  const deleted = new Set();
+  directoryScanVersion++;
+  busy = true;
+  $("btnDeleteOriginals").disabled = true;
+  try {
+    if(await directory.requestPermission({mode:"readwrite"}) !== "granted"){
+      status("Cần cấp quyền ghi thư mục để xoá ảnh gốc.");
+      return;
+    }
+    if(!deleteOriginalsEnabled || directory !== dirHandle || originals !== resultFiles) return;
+    const names = originals.map(file => file.name).join("\n");
+    if(!confirm("Hãy kiểm tra ảnh ghép đã được lưu. Các ảnh sau có thể bị xoá vĩnh viễn:\n\n" + names + "\n\nBạn muốn xoá các ảnh này?")) return;
+    for(const file of originals){
+      const {parent,handle} = fileEntries.get(file);
+      try {
+        const current = await parent.getFileHandle(file.name);
+        const snapshot = await current.getFile();
+        if(!await current.isSameEntry(handle) || snapshot.size !== file.size || snapshot.lastModified !== file.lastModified){
+          log("Bỏ qua ảnh đã thay đổi: " + file.name,"er");
+          continue;
+        }
+        await parent.removeEntry(file.name);
+        deleted.add(file);
+      }catch(e){ log("Không xoá được " + file.name + ": " + e.message,"er"); }
+    }
+    scannedFiles = scannedFiles.filter(file => !deleted.has(file));
+    lastScan = JSON.stringify(recentCandidates(scannedFiles).map(({file}) => identity(file)));
+    resultFiles = originals.filter(file => !deleted.has(file));
+    status("Đã xoá " + deleted.size + "/" + originals.length + " ảnh gốc.");
+  }catch(e){ status("Không thể xoá ảnh gốc: " + e.message); }
+  finally {
+    busy = false;
+    $("btnDeleteOriginals").disabled = false;
+    updateDeleteButton();
+  }
+};
+
+/* ====== khởi động ====== */
+const HAS_DIR = "showDirectoryPicker" in window;
+const androidButton = $("btnAndroidShare");
+const androidInput = $("androidFileIn");
+let pendingAndroidShare = null;
+androidButton.hidden = !/Android/i.test(navigator.userAgent);
+
+function resetAndroidShare(){
+  pendingAndroidShare = null;
+  androidButton.textContent = "Ghép 3 ảnh và chia sẻ";
+}
+
+async function shareOnAndroid(){
+  if(await share(pendingAndroidShare)) resetAndroidShare();
+}
+
+androidButton.onclick = async () => {
+  if(busy) return;
+  if(!pendingAndroidShare){ androidInput.click(); return; }
+  androidButton.disabled = true;
+  try{ await shareOnAndroid(); }
+  finally{ androidButton.disabled = false; }
+};
+
+androidInput.onchange = async () => {
+  const files = [...androidInput.files];
+  androidInput.value = "";
+  if(busy) return;
+  if(files.length !== 3){ status("Hãy chọn đúng 3 ảnh."); return; }
+  sourceFiles = files;
+  lastScan = "";
+  setActions([["Chọn lại ảnh",pickFiles,true]]);
+  androidButton.disabled = true;
+  try{
+    if(!await run(files,{forSharing:true})) return;
+    const data = await shareData();
+    if(!navigator.share || !navigator.canShare?.(data)){
+      status("Trình duyệt này không hỗ trợ chia sẻ ảnh. Hãy bấm Lưu ảnh.");
+      return;
+    }
+    pendingAndroidShare = data;
+    androidButton.textContent = "Chia sẻ ảnh đến Acc";
+    status($("status").textContent + " Chia sẻ qua Messenger → Acc.");
+    if(navigator.userActivation?.isActive) await shareOnAndroid();
+  }catch(e){ status(e.message); }
+  finally{ androidButton.disabled = false; }
+};
+
+function setActions(items){
+  const box=$("actions"); box.innerHTML="";
+  items.forEach(([label,fn,sec])=>{ const b=document.createElement("button"); b.textContent=label; if(sec)b.className="sec"; b.onclick=fn; box.appendChild(b); });
+}
+
+async function pickDir(){
+  try{
+    dirHandle = await showDirectoryPicker({id:"ghep3anh", mode:"read", startIn:"downloads"});
+    sourceFiles = null;
+    lastScan = ""; lastResult = ""; resultFiles = [];
+    updateDeleteButton();
+    try{ await navigator.storage?.persist?.(); }catch(e){}   // xin giữ dữ liệu để không bị xoá thư mục đã nhớ
+    await kvSet("dir", dirHandle);
+    start();
+  }catch(e){ /* huỷ */ }
+}
+function pickFiles(){ $("fileIn").click(); }
+$("fileIn").onchange = e=>{ sourceFiles=[...e.target.files]; e.target.value=""; start(); };
+
+let regrantWaiting = false;
+async function start(){
+  if(sourceFiles){ setActions([["Chọn lại ảnh",pickFiles,true]]); return run(sourceFiles); }
+  if(HAS_DIR){
+    if(!dirHandle) dirHandle = await kvGet("dir");
+    if(dirHandle){
+      let perm = await dirHandle.queryPermission({mode:"read"});
+      if(perm!=="granted"){
+        // Android không giữ quyền qua lần mở sau, nhưng vẫn nhớ thư mục: chạm 1 lần là xong, không phải chọn lại.
+        status("Chạm vào bất kỳ đâu để mở lại thư mục “" + dirHandle.name + "”.");
+        if(regrantWaiting) return;
+        regrantWaiting = true;
+        const regrant = async()=>{
+          document.removeEventListener("click",regrant,true);
+          regrantWaiting = false;
+          try{ perm = await dirHandle.requestPermission({mode:"read"}); }
+          catch(e){ perm = "denied"; }
+          if(perm==="granted") start();
+          else { status("Chưa được cấp quyền. Chạm lại hoặc bấm Đổi thư mục."); regrantWaiting = true; document.addEventListener("click",regrant,true); }
+        };
+        document.addEventListener("click",regrant,true);
+        setActions([["Mở thư mục “" + dirHandle.name + "”",()=>{}],["Đổi thư mục",pickDir,true]]);
+        return;
+      }
+      setActions([["Đổi thư mục",pickDir,true]]);
+      const directory = dirHandle;
+      const version = directoryScanVersion;
+      try{
+        const files = await filesFromDir(directory);
+        if(directory === dirHandle && version === directoryScanVersion && !sourceFiles) return run(files);
+        return;
+      }
+      catch(e){ status("Không đọc được thư mục, hãy chọn lại."); dirHandle=null; }
+    }
+    status("Lần đầu: chọn thư mục “3 ảnh” (Downloads\\3 ảnh). Chỉ cần làm 1 lần.");
+    setActions([["Chọn thư mục 3 ảnh",pickDir],["Hoặc chọn ảnh",pickFiles,true]]);
+  }else{
+    status("Chọn các ảnh gần nhất trong thư viện (cứ chọn nhiều, tool tự lọc 3 ảnh đúng).");
+    setActions([["Chọn ảnh",pickFiles]]);
+  }
+}
+/* ====== cài đặt: link ?canhbao=NN > đã lưu > mặc định ====== */
+async function loadSettings(){
+  const fromUrl = Number(new URLSearchParams(location.search).get("canhbao"));
+  const saved = await kvGet("morale-alert");
+  if(fromUrl >= 1 && fromUrl <= 100) MORALE_ALERT = fromUrl/100;
+  else if(typeof saved === "number") MORALE_ALERT = saved;
+  $("setMorale").value = Math.round(MORALE_ALERT*100);
+  deleteOriginalsEnabled = await kvGet("delete-originals") === true;
+  $("setDeleteOriginals").checked = deleteOriginalsEnabled;
+  updateDeleteButton();
+}
+$("setMorale").onchange = async e => {
+  const v = Math.round(Number(e.target.value));
+  if(!(v >= 1 && v <= 100)){ e.target.value = Math.round(MORALE_ALERT*100); return; }
+  MORALE_ALERT = v/100;
+  await kvSet("morale-alert", MORALE_ALERT);
+  status("Đã lưu mốc báo động " + v + "%.");
+  lastScan = ""; lastResult = ""; start();
+};
+$("setDeleteOriginals").onchange = async e => {
+  deleteOriginalsEnabled = e.target.checked;
+  updateDeleteButton();
+  await kvSet("delete-originals",deleteOriginalsEnabled);
+};
+loadSettings().then(start);
+setInterval(() => {
+  if(dirHandle && !sourceFiles && !busy && document.visibilityState === "visible") start();
+},12000);
+</script>
+</body>
+</html>
