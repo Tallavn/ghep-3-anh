@@ -767,11 +767,50 @@ async function shareOnAndroid(){
   if(await share(pendingAndroidShare)) resetAndroidShare();
 }
 
+const waitIdle = async () => { while(busy) await new Promise(r => setTimeout(r,150)); };
+
+// Ghép từ danh sách file rồi mở chia sẻ (nếu còn quyền thao tác của lần chạm, không thì chờ chạm lần 2).
+async function composeAndShare(files){
+  await waitIdle();
+  lastScan = "";
+  if(!await run(files,{forSharing:true})) return;
+  const data = await shareData();
+  if(!navigator.share || !navigator.canShare?.(data)){
+    status("Trình duyệt này không hỗ trợ chia sẻ ảnh. Hãy bấm Lưu ảnh.");
+    return;
+  }
+  pendingAndroidShare = data;
+  androidButton.textContent = "Chia sẻ ảnh đến Acc";
+  status($("status").textContent + " Chia sẻ qua Messenger → Acc.");
+  if(navigator.userActivation?.isActive) await shareOnAndroid();
+}
+
+// Lấy ảnh từ thư mục đã nhớ. null = chưa có thư mục (dùng trang chọn ảnh), undefined = bị từ chối quyền.
+async function rememberedFolderFiles(){
+  if(!HAS_DIR || sourceFiles) return null;
+  if(!dirHandle) dirHandle = await kvGet("dir");
+  if(!dirHandle) return null;
+  let perm = await dirHandle.queryPermission({mode:"read"});
+  if(perm !== "granted"){
+    try{ perm = await dirHandle.requestPermission({mode:"read"}); }
+    catch(e){ perm = "denied"; }
+  }
+  if(perm !== "granted"){ status("Chưa được cấp quyền thư mục “" + dirHandle.name + "”. Bấm lại hoặc Đổi thư mục."); return undefined; }
+  stopRegrant();
+  setActions([["Đổi thư mục",pickDir,true]]);
+  status("Đang đọc thư mục “" + dirHandle.name + "”…");
+  return filesFromDir(dirHandle);
+}
+
 androidButton.onclick = async () => {
-  if(busy) return;
-  if(!pendingAndroidShare){ androidInput.click(); return; }
+  if(androidButton.disabled) return;
   androidButton.disabled = true;
-  try{ await shareOnAndroid(); }
+  try{
+    if(pendingAndroidShare){ await shareOnAndroid(); return; }
+    const files = await rememberedFolderFiles();
+    if(files === null){ androidInput.click(); return; }
+    if(files) await composeAndShare(files);
+  }catch(e){ status(e.message); }
   finally{ androidButton.disabled = false; }
 };
 
@@ -781,21 +820,10 @@ androidInput.onchange = async () => {
   if(busy) return;
   if(files.length !== 3){ status("Hãy chọn đúng 3 ảnh."); return; }
   sourceFiles = files;
-  lastScan = "";
   setActions([["Chọn lại ảnh",pickFiles,true]]);
   androidButton.disabled = true;
-  try{
-    if(!await run(files,{forSharing:true})) return;
-    const data = await shareData();
-    if(!navigator.share || !navigator.canShare?.(data)){
-      status("Trình duyệt này không hỗ trợ chia sẻ ảnh. Hãy bấm Lưu ảnh.");
-      return;
-    }
-    pendingAndroidShare = data;
-    androidButton.textContent = "Chia sẻ ảnh đến Acc";
-    status($("status").textContent + " Chia sẻ qua Messenger → Acc.");
-    if(navigator.userActivation?.isActive) await shareOnAndroid();
-  }catch(e){ status(e.message); }
+  try{ await composeAndShare(files); }
+  catch(e){ status(e.message); }
   finally{ androidButton.disabled = false; }
 };
 
@@ -819,6 +847,12 @@ function pickFiles(){ $("fileIn").click(); }
 $("fileIn").onchange = e=>{ sourceFiles=[...e.target.files]; e.target.value=""; start(); };
 
 let regrantWaiting = false;
+let regrantHandler = null;
+function stopRegrant(){
+  if(regrantHandler) document.removeEventListener("click",regrantHandler,true);
+  regrantHandler = null;
+  regrantWaiting = false;
+}
 async function start(){
   if(sourceFiles){ setActions([["Chọn lại ảnh",pickFiles,true]]); return run(sourceFiles); }
   if(HAS_DIR){
@@ -830,14 +864,15 @@ async function start(){
         status("Chạm vào bất kỳ đâu để mở lại thư mục “" + dirHandle.name + "”.");
         if(regrantWaiting) return;
         regrantWaiting = true;
-        const regrant = async()=>{
-          document.removeEventListener("click",regrant,true);
-          regrantWaiting = false;
+        const regrant = async e=>{
+          if(androidButton.contains(e.target)) return;   // nút ghép + chia sẻ tự xin quyền
+          stopRegrant();
           try{ perm = await dirHandle.requestPermission({mode:"read"}); }
           catch(e){ perm = "denied"; }
           if(perm==="granted") start();
-          else { status("Chưa được cấp quyền. Chạm lại hoặc bấm Đổi thư mục."); regrantWaiting = true; document.addEventListener("click",regrant,true); }
+          else { status("Chưa được cấp quyền. Chạm lại hoặc bấm Đổi thư mục."); regrantWaiting = true; regrantHandler = regrant; document.addEventListener("click",regrant,true); }
         };
+        regrantHandler = regrant;
         document.addEventListener("click",regrant,true);
         setActions([["Mở thư mục “" + dirHandle.name + "”",()=>{}],["Đổi thư mục",pickDir,true]]);
         return;
