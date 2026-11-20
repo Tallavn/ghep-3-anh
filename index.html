@@ -32,8 +32,8 @@
 <div id="status">Đang khởi động…</div>
 <canvas id="out"></canvas>
 <div class="row" id="resultBtns" style="display:none">
-  <button id="btnSave">Lưu ảnh</button>
-  <button id="btnShare" class="sec">Chia sẻ</button>
+  <button id="btnShare">Chia sẻ</button>
+  <button id="btnSave" class="sec">Lưu ảnh</button>
   <button id="btnCopy" class="sec">Copy</button>
   <button id="btnRe" class="sec">Tạo lại</button>
   <button id="btnDeleteOriginals" class="sec" hidden>Xoá ảnh gốc</button>
@@ -44,6 +44,8 @@
   <label>Báo động khi morale của nhân vật được khoanh dưới
     <input id="setMorale" type="number" min="1" max="100" step="1"> %</label>
   <small>Lưu trong trình duyệt này. Tasker có thể ép mốc qua link: <code>ghep_3_anh_2.html?canhbao=50</code></small>
+  <label><input id="setAutoDownload" type="checkbox"> Tự tải ảnh về sau khi ghép</label>
+  <small>Tắt thì chỉ hiện nút Chia sẻ / Lưu ảnh, không tự tải. Mặc định tắt trên điện thoại.</small>
   <label><input id="setDeleteOriginals" type="checkbox"> Cho phép xoá ảnh gốc sau khi ghép</label>
   <small>Áp dụng cho ảnh đọc từ thư mục. Hãy lưu ảnh ghép trước khi xoá.</small>
 </details>
@@ -164,6 +166,7 @@ let resultFiles = [];
 let scannedFiles = [];
 let directoryScanVersion = 0;
 let deleteOriginalsEnabled = false;
+let autoDownload = !/Android|iPhone|iPad/i.test(navigator.userAgent);
 function updateDeleteButton(){
   $("btnDeleteOriginals").hidden = !deleteOriginalsEnabled || !resultFiles.length;
 }
@@ -244,7 +247,7 @@ async function run(files,{forSharing = false} = {}){
       status("Đang ghép…");
       await compose(group);
       lastResult = result;
-      if(!forSharing && await kvGet("last-download") !== result){
+      if(!forSharing && autoDownload && await kvGet("last-download") !== result){
         await download();
         await kvSet("last-download",result);
       }
@@ -865,6 +868,9 @@ async function loadSettings(){
   $("setMorale").value = Math.round(MORALE_ALERT*100);
   deleteOriginalsEnabled = await kvGet("delete-originals") === true;
   $("setDeleteOriginals").checked = deleteOriginalsEnabled;
+  const savedAuto = await kvGet("auto-download");
+  if(typeof savedAuto === "boolean") autoDownload = savedAuto;
+  $("setAutoDownload").checked = autoDownload;
   updateDeleteButton();
 }
 $("setMorale").onchange = async e => {
@@ -874,6 +880,10 @@ $("setMorale").onchange = async e => {
   await kvSet("morale-alert", MORALE_ALERT);
   status("Đã lưu mốc báo động " + v + "%.");
   lastScan = ""; lastResult = ""; start();
+};
+$("setAutoDownload").onchange = async e => {
+  autoDownload = e.target.checked;
+  await kvSet("auto-download",autoDownload);
 };
 $("setDeleteOriginals").onchange = async e => {
   deleteOriginalsEnabled = e.target.checked;
