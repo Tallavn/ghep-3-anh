@@ -1130,7 +1130,17 @@ androidButton.onclick = async () => {
   try{
     if(pendingAndroidShare){ await shareOnAndroid(); return; }
     const files = await rememberedFolderFiles();
-    if(files === null){ androidDirIn.click(); return; }
+    if(files === null){
+      if(HAS_DIR){
+        const picked = await showDirectoryPicker({id:"ghep3anh-android", mode:"read", startIn:"pictures"});
+        dirHandle = picked;
+        sourceFiles = null;
+        await kvSet("dir", dirHandle);
+        const folderFiles = await filesFromDir(dirHandle);
+        await composeAndShare(folderFiles);
+      }else androidDirIn.click();
+      return;
+    }
     if(files) await composeAndShare(files);
   }catch(e){ status(e.message); }
   finally{ androidButton.disabled = false; }
