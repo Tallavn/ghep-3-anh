@@ -295,6 +295,80 @@ const COMBO = {
 };
 const ROOM_IDS  = {fac:["F1","F2","F3","F4"], trade:["T1","T2","T3"]};
 const ROOM_NAME = {F1:"Factory 1",F2:"Factory 2",F3:"Factory 3",F4:"Factory 4",T1:"Trading Post 1",T2:"Trading Post 2",T3:"Trading Post 3"};
+
+/* ====== tính % năng suất từng phòng (Arknights Base Combo Guide: sheet FAC, TP, SPECIAL) ======
+   Giả định: operator E2, base 4 FAC / 3 TP / 2 PP, Reception Room cấp 3, CHƯA cộng buff từ Control Center.
+   Phòng đủ người thì cộng thêm % nội tại = cấp phòng (cấp 3: +3%). Ô Distracted không tính.
+   TP có Shamare / Proviso: là % hiệu quả quy đổi theo guide (vì 2 người này đổi chất lượng đơn, không cộng % thẳng). */
+const ROOM_LV = {F1:2, F2:3, F3:3, F4:1, T1:2, T2:3, T3:3};
+const BASE    = {pp:2, tp:3, rr:3};
+const EST     = {rosmontis:74, ebenholz:38, mrNothing:80};   // phụ thuộc cả base (PI/SR/WP): lấy số guide cho setup 342
+const RT    = ["Dorothy","Silence the Paradigmatic","Silence","Ptilopsis","Astgenne","Nasti"];   // kỹ năng Rhine Tech
+const METAL = ["Bryophyta","Thorns the Lodestar","Gravel","Haze","Spot","Warmy"];             // kỹ năng Metalwork
+const STD   = ["Mizuki","Jessica","Vanilla","Perfumer","Roberta","Steward","Highmore"];        // kỹ năng Standardization
+const AH_OPS = ["Gladiia","Skadi","Specter","Andreana","Ulpianus"];                           // Abyssal Hunters
+const FAC_PCT = {
+  "Purestream":()=>20*BASE.tp,                 // +20%/TP, không bị Automation huỷ
+  "Dorothy":c=>25 + 5*c.rt,                    // +25% RT, +5% mỗi kỹ năng RT trong phòng (tính cả mình)
+  "Silence the Paradigmatic":()=>30,
+  "Fartooth":()=>25,
+  "Bryophyta":()=>30,
+  "Thorns the Lodestar":()=>30 + 3*BASE.tp,
+  "Gravel":()=>35, "Haze":()=>30,
+  "FEater":()=>35, "Conviction":()=>35,
+  "Mizuki":c=>25 + 5*c.std,                    // +25% Standard, +5% mỗi kỹ năng Standard trong phòng
+  "Rosmontis":()=>EST.rosmontis,
+};
+const TP_PCT = {
+  "Lemuen":c=>20 + (c.has("Exusiai") ? 25 : 0),
+  "Exusiai":()=>35,
+  "Vigil":()=>25 + 5*BASE.rr,
+  "Morgan":c=>c.has("Siege") ? 20 : 0,
+  "Siege":c=>c.has("Morgan") ? 55 : 35,
+  "Ebenholz":()=>EST.ebenholz,
+  "Mr. Nothing":()=>EST.mrNothing,
+  "Underflow":()=>30,
+  "Tequila":()=>0, "Bibeak":()=>0, "Kafka":()=>0,   // chỉ tăng chất lượng đơn
+};
+/* names: operator đang làm việc trong phòng; ahAll: số Abyssal Hunter đang làm ở mọi Factory.
+   Trả {pct, unknown}: unknown = người không có trong bảng (không cộng %). */
+function roomPct(room, names, ahAll){
+  const lv = ROOM_LV[room], has = n => names.includes(n);
+  const innate = names.length >= lv ? lv : 0;
+  const unknown = [];
+  if(room[0] === "F"){
+    const c = {rt:names.filter(n=>RT.includes(n)).length, std:names.filter(n=>STD.includes(n)).length};
+    if(has("Weedy"))   // Automation: huỷ % người khác (trừ Purestream), +15%/PP
+      return {pct: innate + 15*BASE.pp + (has("Purestream") ? FAC_PCT.Purestream() : 0),
+              unknown: names.filter(n => n!=="Weedy" && n!=="Purestream" && !FAC_PCT[n] && !AH_OPS.includes(n))};
+    let normal = 0, ah = 0, waai = 0;
+    for(const n of names){
+      if(AH_OPS.includes(n)) ah += 10*ahAll;             // Special Bonus: +10% mỗi AH đang ở Factory
+      else if(n === "Waai Fu") waai++;
+      else if(FAC_PCT[n]) normal += FAC_PCT[n](c) + (has("Bryophyta") && METAL.includes(n) ? 5 : 0);
+      else unknown.push(n);
+    }
+    ah = Math.min(ah, 90);
+    // Waai Fu: +5% cho mỗi 5% "thường" của người khác (không tính AH, Purestream), tối đa 40%
+    const copy = Math.min(40, Math.floor((normal - (has("Purestream") ? FAC_PCT.Purestream() : 0))/5)*5);
+    return {pct: innate + normal + ah + waai*Math.max(0,copy), unknown};
+  }
+  if(has("Shamare")){   // huỷ % người khác, +45%/người; % hiệu quả theo bảng guide (TP cấp 3)
+    const teq = has("Tequila"), bib = has("Bibeak") || has("Kafka");
+    const pct = names.length < 3 ? 45*(names.length-1) + innate : teq && bib ? 138 : teq ? 124 : bib ? 93 : 92;
+    return {pct, unknown: names.filter(n => n!=="Shamare" && !TP_PCT[n])};
+  }
+  let raw = 0;
+  for(const n of names){
+    if(n === "Proviso") continue;
+    if(TP_PCT[n]) raw += TP_PCT[n]({has}); else unknown.push(n);
+  }
+  if(has("Proviso")){   // Proviso E2 đổi đơn 2-3 vàng: (100 + % khác + nội tại) × hệ số − 100
+    const mult = lv === 2 ? 1.811073 : 1.551724;
+    return {pct: Math.round((100 + raw + innate)*mult - 100), unknown};
+  }
+  return {pct: raw + innate, unknown};
+}
 /* chữ ký chân dung 16x12 RGB của từng nhân vật, lấy từ ảnh 17/11 0h (Team 1) và 5h (Team 2) */
 const OPS = {
   "Weedy":"JycnJiYmJiYmJiYmJiYmJicnJiYmJScoKCwzOzw8Pj47JSYlJiYmJiYmJiYmJycnICAgICAgICAgICAgJSYnICEjIyQlOj9MLjNIJSYmGxsbHx8fIB8fICAgICAgICAgHR0dHR0dHR0dHR0dISMkHiIlPkNNQkRGNDc8LzI5Jys1ISIjHR0dHR0dHR0dHR0dGxsbGxsbGxsaGxscODo8X19lR0lNWlVOWFdfZV9fZmZlQkNGIiIlGhoaHR4eGx0dGhoaGRkZGhoaRUVHbWtuaGhsf358f35+f39/enZ1Yl1gb2tqV1RZKCkpJystMTE0GRkZHR4gRkdOeHV0dnJwf3x5fndzf3dzf3h0fXdzf3l1eW1ne3NuV1RcRUFPIiMqGBkZJjVIcW9vfXZyfnZxfHNtfnZxf3h0f3dydWNcfnJsfHFtfnVwYFtdTEpbQTtSGx0fVFBPfHRvemxmfnVudWJXf3dyfnhze29oaFBDfXBpdmFYe3FtdWhfS0VLISE2Mi8sUUhOeXFsempjeWVbZ05Ad2VcfG5mc19SVDIoWDkublRHeGNWfW1kWVBJHBwfHx4dPTtLdmlkd2FYWkA4Wi0kdmNWfG5efnZpdUc5elpMd2BWdmNYcF9WOjErSUlVGBgYHx4eY1BIdmJZcVtOe15RfXJnfnRmfnVmfnRkdWVYbF9UbGBVcGVaXFBIHR4ePj1GIiIrT0JBcFVJcl9UfXNlfXJkemtdeGZZfXFjfG5dZ1VHV1FQQD08cmVZbGJW",
@@ -492,8 +566,9 @@ async function compose(list){
             const morale = moraleOf(px,top,j);
             if(morale === null) continue;          // ô trống / ô khóa: không có thanh morale
             const id = identify(slotSig(px,top,j));
-            slots.push({j,name:id.name,d:id.d});
-            if(distracted(px,top,j)){ warns.push(ROOM_NAME[room] + ": " + (id.name || "?") + " Distracted (hết morale)"); badSlots.push({i,r,j}); }
+            const dis = distracted(px,top,j);
+            slots.push({j,name:id.name,d:id.d,dis});
+            if(dis){ warns.push(ROOM_NAME[room] + ": " + (id.name || "?") + " Distracted (hết morale)"); badSlots.push({i,r,j}); }
             if(target && id.name === target && (!mark || id.d < mark.d)) mark = {d:id.d,i,r,j,morale};
           }
           roomSlots.push({i,r,room,slots});
@@ -612,6 +687,36 @@ async function compose(list){
     }
     sec.y = y;
     y += sec.height+SG;
+  }
+
+  // % năng suất từng phòng: số lớn = theo người đang làm; dòng nhỏ = chuẩn nếu đúng combo team
+  {
+    const s = TW/(REF.x1-REF.x0);
+    const working = x => x.slots.filter(sl => !sl.dis).map(sl => sl.name || "?");
+    const ahOf = lists => lists.reduce((n,l) => n + l.filter(m => AH_OPS.includes(m)).length, 0);
+    const facRooms = roomSlots.filter(x => x.room[0] === "F");
+    const ahNow = ahOf(facRooms.map(working));
+    const stdNames = room => COMBO[team][room].map(g => [].concat(g)[0]);
+    const ahStd = ahOf(ROOM_IDS.fac.map(stdNames));
+    for(const x of roomSlots){
+      const cur = roomPct(x.room, working(x), ahNow), std = roomPct(x.room, stdNames(x.room), ahStd);
+      const low = cur.pct < std.pct, unk = cur.unknown.length > 0;
+      const color = low ? LINEUP_COLOR : MARK_COLOR;
+      const bx = M+RW+RG + (SLOT.x + 3*SLOT.pitch + 10)*s, bw = (REF.x1-REF.x0 - SLOT.x - 3*SLOT.pitch - 24)*s;
+      const by = sections[x.i].y + x.r*(TH+GAP) + 14*s, bh = TH - 28*s;
+      g.save();
+      g.fillStyle = "rgba(13,17,23,.82)"; g.strokeStyle = color; g.lineWidth = 3;
+      g.beginPath(); g.roundRect(bx,by,bw,bh,14); g.fill(); g.stroke();
+      g.textAlign = "center"; g.textBaseline = "middle";
+      g.fillStyle = color; g.font = "800 66px " + FONT; g.letterSpacing = "-1px";
+      g.fillText(cur.pct + "%" + (unk ? "?" : ""), bx+bw/2, by+bh*0.42);
+      g.letterSpacing = "0px";
+      g.fillStyle = "#c3cad5"; g.font = "600 21px " + FONT;
+      g.fillText(unk ? "có người lạ · chuẩn " + std.pct + "%" : low ? "chuẩn " + std.pct + "%" : "đúng combo", bx+bw/2, by+bh*0.8);
+      g.restore();
+      g.letterSpacing = "0px"; g.textAlign = "left"; g.textBaseline = "alphabetic";
+      log(ROOM_NAME[x.room] + ": " + cur.pct + "% (chuẩn Team " + team + ": " + std.pct + "%)" + (unk ? ", không có số cho: " + cur.unknown.join(", ") : ""), low ? "er" : "ok");
+    }
   }
 
   // vòng khoanh 1 ô + nhãn
